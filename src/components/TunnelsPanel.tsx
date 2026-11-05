@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "../ipc";
 import { Plus, X, Activity, AlertTriangle, Globe, ArrowRight, ArrowDownLeft, Square, FileText, Trash2 } from "lucide-react";
 
 // Tunnels panel — lists active SSH port-forwards for a session and lets the

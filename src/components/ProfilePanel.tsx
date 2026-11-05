@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import {
   Cloud, CloudOff, RefreshCw, Share2, UserPlus, X, Loader2, Users,
   AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive,

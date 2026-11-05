@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import { createPortal } from "react-dom";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isGateway, listen } from "../ipc";
+import { uploadBrowserFiles } from "../fs/gatewayFiles";
 import { File as FileIcon, Download, Upload, AlertTriangle, Check, X, Ban, Folder, FolderUp, Rows, LayoutPanelTop } from "lucide-react";
 import FilePanel, { ActiveDrag, FilePanelHandle } from "./FilePanel";
 import MirrorsPanel from "./MirrorsPanel";
@@ -191,6 +191,39 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
     invoke("sftp_cancel_transfer", { transferId: id }).catch(() => {});
   };
 
+  // Gateway (browser) mode: no server-local filesystem exists, so the Local
+  // pane can't list anything. Force the Remote side and offer an "Upload"
+  // button that posts browser-picked files to the HTTP upload endpoint.
+  const gateway = isGateway();
+  useEffect(() => {
+    if (gateway) {
+      setActiveSidePersisted("remote");
+      setLayoutPersisted("tabs");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gateway]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const handleGatewayFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    // Snapshot NOW: input.files is a live list and the onChange handler
+    // resets the input in the same tick — after any await, files[0] would
+    // read undefined and turn a successful upload into a false error
+    // (and skip the refresh below).
+    const picked = Array.from(files);
+    if (picked.length === 0) return;
+    const firstName = picked[0]?.name ?? "file";
+    const dest = remoteRef.current?.currentDir();
+    if (!dest) { notify("Open a remote directory first.", "error"); return; }
+    notify(`Uploading ${picked.length === 1 ? firstName : `${picked.length} files`}…`, "info");
+    try {
+      const n = await uploadBrowserFiles(sessionId, dest, picked);
+      notify(n === 1 ? `Uploaded ${firstName}` : `Uploaded ${n} files`, "success");
+      remoteRef.current?.refresh();
+    } catch (err: any) {
+      notify(`Upload failed: ${err}`, "error");
+    }
+  };
+
   const formatBytes = (n: number) => {
     if (!n) return "0 B";
     const k = 1024, units = ["B", "KB", "MB", "GB"];
@@ -322,7 +355,8 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
             user can predict what clicking will do. */}
         <div className="shrink-0 h-10 sm:h-8 flex items-stretch border-b border-white/5 bg-black/20">
           {layout === "tabs" ? (
-            <div className="flex-1 grid grid-cols-2">
+            <div className={`flex-1 grid ${gateway ? "grid-cols-1" : "grid-cols-2"}`}>
+              {!gateway && (
               <button
                 onClick={() => setActiveSidePersisted("local")}
                 className={`h-full flex items-center justify-center gap-1.5 text-[10px] font-bold uppercase tracking-wider transition-all ${
@@ -333,6 +367,7 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
               >
                 <Folder size={11} /> Local
               </button>
+              )}
               <button
                 onClick={() => setActiveSidePersisted("remote")}
                 className={`h-full flex items-center justify-center gap-1.5 text-[10px] font-bold uppercase tracking-wider transition-all ${
@@ -348,6 +383,24 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
             <div className="flex-1 flex items-center px-3 text-[9.5px] font-bold uppercase tracking-widest text-zinc-500">
               Local + Remote
             </div>
+          )}
+          {gateway && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => { handleGatewayFiles(e.target.files); e.target.value = ""; }}
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                title="Upload files from this device to the current remote directory"
+                className="px-3 border-l border-white/5 text-[10px] font-bold uppercase tracking-wider text-zinc-400 hover:bg-white/5 hover:text-white flex items-center gap-1.5 transition-all shrink-0"
+              >
+                <Upload size={11} /> Upload
+              </button>
+            </>
           )}
           <button
             onClick={() => setLayoutPersisted(layout === "tabs" ? "split" : "tabs")}

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import { FileEntry, ListResult, RemoteFileProvider } from "./types";
 
 // SFTP provider. Wraps the existing `sftp_*` Tauri commands behind the

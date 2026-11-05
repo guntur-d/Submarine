@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import { X, Github, Globe, RefreshCw, CheckCircle2, ArrowUpCircle, AlertTriangle } from "lucide-react";
 import logoUrl from "../assets/logo.png";
 

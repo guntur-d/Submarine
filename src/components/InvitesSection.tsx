@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import { Users, Check, Loader2, Download, AlertTriangle, X } from "lucide-react";
 import { useTextPrompt } from "../ui/confirm";
 import { RoleBadge } from "./shareRoles";

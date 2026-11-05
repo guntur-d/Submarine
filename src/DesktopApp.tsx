@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { invoke, isGateway, listen } from "./ipc";
+import { LogicalSize } from "@tauri-apps/api/window";
+import { getAppWindow } from "./gatewayWindow";
 import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
@@ -28,8 +29,6 @@ import { SessionView } from "./components/SessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 
-const appWindow = getCurrentWindow();
-
 // Sessions can be either DB-backed (saved node, `serverId > 0`) or quick
 // connect (one-shot, `serverId === 0` and `quickAuth` populated). SessionView
 // forwards `quickAuth` to `initiate_connection` which uses it instead of
@@ -44,6 +43,11 @@ const hexToRgb = (hex: string) => {
 };
 
 function DesktopApp() {
+  // Acquired lazily on mount, never at module scope. Real Tauri window in
+  // the WebView, viewport-backed no-op stub in gateway (browser) mode —
+  // App.tsx only mounts us when one of the two runtimes exists. useState
+  // initializer keeps one stable instance without adding a new hook import.
+  const [appWindow] = useState(() => getAppWindow());
   const [loading, setLoading] = useState(true);
   const [isUnlocked, setIsUnlocked] = useState(false);
   // Multi-exec broadcast state lives in a shared provider (see App.tsx) so
@@ -774,6 +778,28 @@ function DesktopApp() {
     addLog("Profile locked.", "info");
   };
 
+  // Silent lock for the gateway idle-timeout path. The backend already ran
+  // close_profile_inner + broadcast vault-locked, so there is nothing to
+  // confirm or tear down — just reset the UI to the picker. No confirm()
+  // here on purpose: this fires without user interaction.
+  const silentLock = useCallback((reason: string) => {
+    setIsUnlocked(false);
+    setActiveProfile(null);
+    setSessions([]);
+    setActiveView("nodes");
+    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
+    setNotes([]);
+    addLog(reason === "idle-timeout" ? "Locked after idle timeout." : "Vault locked.", "info");
+  }, [addLog]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<{ reason?: string }>("vault-locked", (e) => {
+      silentLock((e.payload as any)?.reason ?? "");
+    }).then((fn) => { unlisten = fn; }).catch(() => {});
+    return () => { if (unlisten) unlisten(); };
+  }, [silentLock]);
+
   const openServer = (server: any) => {
     const sessionId = `session-${server.id}`;
     const existing = sessions.find(s => s.id === sessionId);
@@ -1401,7 +1427,10 @@ function DesktopApp() {
       {/* Window controls: desktop only. Android has its own gesture nav /
           system back button, and the WebView window has no minimise or
           maximise affordance to surface — so we hide the whole cluster on
-          phone and reclaim ~120 px of titlebar for the tab strip. */}
+          phone and reclaim ~120 px of titlebar for the tab strip. Gateway
+          (browser) mode hides them too: the stub window behind `appWindow`
+          is a no-op and there is nothing to minimise. */}
+      {!isGateway() && (
       <div className="hidden sm:flex items-center h-full gap-1 no-drag">
         <button
           onClick={() => appWindow.minimize()}
@@ -1419,6 +1448,7 @@ function DesktopApp() {
         </button>
         <button onClick={() => appWindow.close()} className="w-10 h-full flex items-center justify-center hover:bg-red-500 group transition-all"><X size={14} className="text-zinc-600 group-hover:text-white" /></button>
       </div>
+      )}
       {tabMenu && (() => {
         const targetId = tabMenu.sessionId;
         // Build the "Split view with" picker: every OTHER open session is

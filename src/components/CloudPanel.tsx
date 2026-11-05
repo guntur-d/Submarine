@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import {
   X, AlertTriangle, CheckCircle2, Cloud, ArrowRight, ArrowLeft,
   LogOut, Mail, KeyRound, UserPlus, LogIn, Wand2,

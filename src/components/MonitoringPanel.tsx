@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "../ipc";
 import {
   Activity, Pause, Play, Trash2, Plus, X, Wifi, WifiOff, AlertTriangle,
   RefreshCw, Settings2, FileCode2, Settings as SettingsIcon, Bell, BellOff, Volume2,

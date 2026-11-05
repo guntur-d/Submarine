@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import { FileEntry, ListResult, LocalFileProvider } from "./types";
 
 // Local filesystem provider. All paths are OS-native (backslashes on Windows,

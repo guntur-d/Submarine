@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { createPortal } from "react-dom";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isGateway, listen } from "../ipc";
+import { downloadRemoteFile } from "../fs/gatewayFiles";
 import {
   Folder, File, ArrowUp, RefreshCw, Trash2, Edit3, Shield,
   X, ChevronUp, ChevronDown, Plus, MoreVertical, FolderSearch,
@@ -600,6 +600,28 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   // channel so the user sees uniform cards.
   const downloadItems = async (items: FileEntry[]) => {
     if (!sessionId || items.length === 0) return;
+    // Gateway (browser) mode: no server-local destination exists — stream
+    // each file straight to the browser via the HTTP download endpoint.
+    // Directories aren't supported here yet (single-file endpoint only).
+    if (isGateway()) {
+      const dirs = items.filter((e) => e.isDir);
+      if (dirs.length > 0) {
+        notify(`Folder download isn't supported in the browser yet — download files inside ${dirs[0].name} individually.`, "error");
+        items = items.filter((e) => !e.isDir);
+        if (items.length === 0) return;
+      }
+      let count = 0;
+      for (const e of items) {
+        try {
+          await downloadRemoteFile(sessionId, e.path);
+          count++;
+        } catch (err: any) {
+          notify(`Download failed for ${e.name}: ${err}`, "error");
+        }
+      }
+      if (count > 0) notify(items.length === 1 ? `Downloaded ${items[0].name}` : `Downloaded ${count} of ${items.length} items`, "success");
+      return;
+    }
     let dest = getOppositeDir?.();
     if (!dest) {
       // Fallback destination when the sibling pane hasn't reported a dir

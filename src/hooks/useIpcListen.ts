@@ -1,9 +1,10 @@
 import { useEffect } from "react";
-import { listen, type EventCallback } from "@tauri-apps/api/event";
+import { listen, type EventCallback } from "../ipc";
 
-// Subscribe to a Tauri event. Handles the unmount-before-listen-resolves
-// race via a `cancelled` flag. Pass `enabled = false` to skip subscribing.
-export function useTauriListen<T>(
+// Subscribe to a backend event via the IPC boundary (see `src/ipc.ts`).
+// Handles the unmount-before-listen-resolves race via a `cancelled` flag.
+// Pass `enabled = false` to skip subscribing.
+export function useIpcListen<T>(
   event: string | null | undefined,
   handler: EventCallback<T>,
   deps: React.DependencyList,

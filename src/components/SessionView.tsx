@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, memo } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { invoke, listen } from "../ipc";
+import { LogicalSize } from "@tauri-apps/api/window";
+import { getAppWindow } from "../gatewayWindow";
 import { TerminalSquare, Folder, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw } from "lucide-react";
 import TerminalView from "./TerminalView";
 import SftpWorkspace from "./SftpWorkspace";
@@ -739,7 +739,9 @@ const SessionViewImpl = ({ session, displayName, onClose, addLog, onStatusChange
   // dragging the divider grows or shrinks the OS window in lockstep so the
   // terminal's pixel width never changes underneath the user.
 
-  const appWindow = getCurrentWindow();
+  // Real Tauri window in the WebView, viewport-backed no-op stub in gateway
+  // (browser) mode — see `src/gatewayWindow.ts`. Stable per mount.
+  const [appWindow] = useState(() => getAppWindow());
   const toolWidthRef = useRef(toolPanelWidth);
   useEffect(() => { toolWidthRef.current = toolPanelWidth; }, [toolPanelWidth]);
 

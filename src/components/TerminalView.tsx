@@ -2,8 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { SearchAddon, ISearchOptions } from 'xterm-addon-search';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { invoke, listen } from "../ipc";
 import 'xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey } from './MobileKeyBar';
@@ -354,6 +353,20 @@ const TerminalView = ({
     toastTimerRef.current = window.setTimeout(() => setToast(null), 1400);
   };
 
+  // Browser-console diagnostics for copy/clipboard issues. Off by default;
+  // enable with `localStorage.setItem('submarine-term-debug', '1')` in the
+  // console + reload, then reproduce and send the `[term …]` lines back.
+  // Only wired to rare user actions (mousedown/mouseup/copy/OSC), never
+  // per-frame output, so leaving the flag on during a session is harmless.
+  const termDbg = (...a: any[]) => {
+    try {
+      if (localStorage.getItem('submarine-term-debug') === '1') {
+        // eslint-disable-next-line no-console
+        console.log(`[term ${terminalId}]`, ...a);
+      }
+    } catch { /* storage unavailable — stay quiet */ }
+  };
+
   useEffect(() => {
     if (!terminalRef.current) return;
 
@@ -424,6 +437,37 @@ const TerminalView = ({
     // the matching control sequence before sending (Ctrl+letter → 0x01-0x1a,
     // Alt+char → ESC-prefix). Multi-char inputs (paste, IME composition) are
     // forwarded verbatim because we can't sensibly "Ctrl" a phrase.
+    // OSC 52 clipboard bridge. TUI apps that do their own copy (opencode, …)
+    // announce it via `OSC 52 ; Pc ; base64 ST` instead of touching the DOM
+    // selection — xterm.js drops that on the floor, which is exactly the
+    // "copied in the TUI but paste gives nothing" report (proven by the
+    // `osc52 received` debug lines). Decode Pc=c (system clipboard) and
+    // write it via the same path as select-to-copy. Other targets are left
+    // for the default handler (ignore). Failures stay silent by design —
+    // a background tab may deny clipboard access, and that must never toast.
+    const osc52Disposable = term.parser.registerOscHandler(52, (data: string) => {
+      const semi = data.indexOf(';');
+      const target = (semi >= 0 ? data.slice(0, semi) : '').trim();
+      if (target !== '' && target !== 'c') {
+        termDbg('osc52 ignored target=', JSON.stringify(target));
+        return false;
+      }
+      let text = '';
+      try {
+        const bin = atob((semi >= 0 ? data.slice(semi + 1) : data).trim());
+        text = new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+      } catch {
+        termDbg('osc52 bad base64');
+        return false;
+      }
+      if (!text) return false;
+      termDbg(`osc52 bridging ${text.length} chars to clipboard`);
+      writeClipboard(text).then((ok) => {
+        termDbg(`osc52 clipboard ${ok ? 'ok' : 'DENIED'}`);
+        if (ok) notify('Copied');
+      });
+      return true;
+    });
     const onDataDisposable = term.onData((data) => {
       if (disabledRef.current) return;
       const mods = modifiersRef.current;
@@ -578,10 +622,17 @@ const TerminalView = ({
       }
       return lines.join('\n');
     };
-    const copySelectionIfAny = async () => {
+    const copySelectionIfAny = async (why: string) => {
       const text = buildSelectedText();
-      if (!text) return;
+      const preview = text.length > 80 ? `${text.slice(0, 80)}…(+${text.length - 80})` : text;
+      // Whitespace-only selections (blank TUI padding rows, empty lines)
+      // must neither clobber the clipboard with invisible spaces nor toast
+      // a lie — the classic report is "it said Copied but paste gives
+      // nothing". TUI screens make this easy to hit: big blank areas where
+      // a sloppy drag still yields '\n's, which are truthy but useless.
+      if (!text.trim()) { termDbg(`copy [${why}] skip: blank (${text.length} chars)`); return; }
       const ok = await writeClipboard(text);
+      termDbg(`copy [${why}] ${ok ? `wrote ${text.length} chars ${JSON.stringify(preview)}` : 'FAILED writeClipboard'}`);
       if (ok) notify('Copied');
     };
     // Copy-on-select must fire wherever the mouse is RELEASED — not only inside
@@ -598,15 +649,27 @@ const TerminalView = ({
     // selection) still can't clobber it. The selection end is set by the last
     // mousemove, so it's final by the time we read it on mouseup.
     let selectionArmed = false;
+    // Snapshot of the local selection when the drag started. Mouse-tracking
+    // TUIs (opencode, zellij, …) consume the drag themselves and show their
+    // own "Copied" UI — xterm then creates no local selection, so copying at
+    // release would just re-copy STALE text with a lying toast. If the text
+    // is unchanged since mousedown, this drag produced nothing: skip.
+    let selectionAtDown: string | null = null;
     const onMouseDown = (ev: MouseEvent) => {
       // Assign (not just set-true) so a non-left mousedown re-disarms a flag
       // that got stuck from an earlier drag whose mouseup we never saw.
       selectionArmed = ev.button === 0;
+      selectionAtDown = selectionArmed ? buildSelectedText() : null;
+      termDbg(`mousedown button=${ev.button} armed=${selectionArmed} snapshotLen=${selectionAtDown?.length ?? -1} buf=${term.buffer.active.type}`);
     };
     const onDocMouseUp = (ev: MouseEvent) => {
       if (ev.button !== 0 || !selectionArmed) return;
       selectionArmed = false;
-      void copySelectionIfAny();
+      const snapshot = selectionAtDown;
+      selectionAtDown = null;
+      const now = buildSelectedText();
+      if (now === snapshot) { termDbg(`mouseup skip: unchanged (len=${now.length} buf=${term.buffer.active.type})`); return; }
+      void copySelectionIfAny('mouseup');
     };
     // If the window loses focus mid-drag (Alt-Tab, a focus-stealing dialog),
     // the button is released over another window and the matching `mouseup`
@@ -614,7 +677,7 @@ const TerminalView = ({
     // unrelated left-click would then copy this terminal's stale selection and
     // clobber the clipboard. Disarm on blur so only a release we actually see
     // can copy.
-    const onWindowBlur = () => { selectionArmed = false; };
+    const onWindowBlur = () => { selectionArmed = false; selectionAtDown = null; };
     // Right-click → paste clipboard into the PTY. preventDefault swallows the
     // platform context menu so the user gets the terminal-style behavior they
     // asked for. Disabled sessions silently drop the paste (matches onData).
@@ -642,18 +705,21 @@ const TerminalView = ({
       ev.preventDefault();
       void pasteFromClipboard();
     };
-    // Keyboard paste: Ctrl+Shift+V (classic terminal convention) and Ctrl+V
-    // (Windows Terminal default — also Cmd+V on macOS via metaKey). Plain
-    // Ctrl+C stays untouched: it must keep sending SIGINT to the shell, and
-    // copying is already covered by select-to-copy. preventDefault stops
-    // xterm forwarding the keystroke (Ctrl+V would otherwise arrive at the
-    // shell as a raw 0x16 byte). Skipped inside text inputs (search chip,
-    // history overlay) so native paste keeps working there — note xterm's
-    // own hidden textarea is the only TEXTAREA inside the terminal div, so
-    // gating on INPUT/SELECT/contentEditable is sufficient.
+    // Keyboard copy/paste: Ctrl+Shift+C copies the current selection and
+    // Ctrl+Shift+V pastes (classic terminal conventions — also Cmd on macOS
+    // via metaKey), plus Ctrl+V as the Windows Terminal default. Plain
+    // Ctrl+C stays untouched: it must keep sending SIGINT to the shell
+    // (copying is covered by select-to-copy and the Shift variant here), so
+    // the copy branch requires Shift. preventDefault stops xterm forwarding
+    // the keystroke (Ctrl+V would otherwise arrive at the shell as a raw
+    // 0x16 byte). Skipped inside text inputs (search chip, history overlay)
+    // so native copy/paste keeps working there — note xterm's own hidden
+    // textarea is the only TEXTAREA inside the terminal div, so gating on
+    // INPUT/SELECT/contentEditable is sufficient.
     const onDocKeyDown = (ev: KeyboardEvent) => {
       if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
-      if (ev.key.toLowerCase() !== 'v') return;
+      const k = ev.key.toLowerCase();
+      if (k !== 'v' && !(k === 'c' && ev.shiftKey)) return;
       const container = terminalRef.current;
       if (!container) return;
       const active = document.activeElement;
@@ -663,7 +729,8 @@ const TerminalView = ({
         if (tag === 'INPUT' || tag === 'SELECT' || active.isContentEditable) return;
       }
       ev.preventDefault();
-      void pasteFromClipboard();
+      if (k === 'v') void pasteFromClipboard();
+      else void copySelectionIfAny('hotkey');
     };
     terminalRef.current.addEventListener('mousedown', onMouseDown);
     document.addEventListener('mouseup', onDocMouseUp);
@@ -771,6 +838,7 @@ const TerminalView = ({
       window.removeEventListener('submarine-settings-changed', handleSettingsChange);
       resizeObserver.disconnect();
       onDataDisposable.dispose();
+      osc52Disposable.dispose();
       onResizeDisposable.dispose();
       if (container) {
         container.removeEventListener('mousedown', onMouseDown);

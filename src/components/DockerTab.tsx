@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "../ipc";
 import {
   RefreshCw, Loader2, Play, Square, RotateCw, Pause, X, ChevronRight,
   Container as ContainerIcon, Image as ImageIcon, Database, Network as NetIcon,

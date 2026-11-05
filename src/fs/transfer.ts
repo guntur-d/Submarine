@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import { FileProvider, RemoteFileProvider } from "./types";
 
 // Cross-pane transfer dispatch. Instead of streaming the file through JS, we

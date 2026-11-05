@@ -9,7 +9,8 @@
 export const IS_ANDROID: boolean =
   typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
 
-// True when we're inside a Tauri WebView (desktop or Android). Kept for future
-// use — some UI may want to differentiate a browser preview from packaged app.
+// True when inside a Tauri WebView (desktop or Android). App.tsx uses this as
+// the single boundary: browser (`npm run dev`) renders a fallback instead of
+// mounting DesktopApp, so Tauri-only code never runs outside Tauri.
 export const IS_TAURI: boolean =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
