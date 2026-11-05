@@ -157,3 +157,17 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 tauri-plugin-window-state = "2"
 rfd = "0.14"
 open = "5.1"
+# `submarine serve` gateway mode (Epic A): HTTP + WebSocket server that
+# exposes the Tauri command surface to browsers. Desktop-only by design —
+# Android ships a WebView, not a headless server, so these never enter the
+# mobile build (same gating pattern as rfd/open above).
+axum = { version = "0.7", features = ["ws", "multipart"] }
+tower-http = { version = "0.5", features = ["fs"] }
+# In-process TLS for `serve --tls-cert/--tls-key` (axum-server + rustls).
+# Same desktop gate: no headless server on Android.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Explicit rustls provider for in-process TLS. The tree pulls in both
+# aws-lc-rs and ring (via reqwest + axum-server), so rustls can't pick one
+# on its own — we install aws-lc-rs ourselves in run_serve before loading
+# the cert. Default features off + explicit list keeps the choice ours.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws-lc-rs"] }

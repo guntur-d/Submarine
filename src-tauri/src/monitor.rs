@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use russh::client;
 use russh_keys::key::PublicKey;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use crate::Emit;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{oneshot, Mutex};
 
@@ -143,6 +143,13 @@ pub struct MonitorState {
 
 pub type MonitorMap = Arc<Mutex<HashMap<i32, Arc<MonitorEntry>>>>;
 
+/// Fresh map for a process that runs no monitors yet. Mirrors the
+/// `new_db_state` / `new_mirror_map` pattern: `run()` and `serve` build
+/// from the same helper instead of duplicating the literal.
+pub(crate) fn new_monitor_map() -> MonitorMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 /// Live snapshot of one node as returned by `monitor_list`.
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorInfo {
@@ -229,7 +236,7 @@ pub struct CustomMetric {
 /// the entry in the map. Returns immediately — the connect happens inside
 /// the spawned task so a slow / unreachable host doesn't block the caller.
 pub async fn start_monitor(
-    app: AppHandle,
+    app: Emit,
     map: MonitorMap,
     db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     settings: SharedSettings,
@@ -364,7 +371,7 @@ async fn entry_status(entry: &MonitorEntry) -> MonitorInfo {
 // ---------------------------------------------------------------------------
 
 async fn run_poller(
-    app: AppHandle,
+    app: Emit,
     entry: Arc<MonitorEntry>,
     db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     settings: SharedSettings,
@@ -382,7 +389,7 @@ async fn run_poller(
     // threshold. Caller still has the responsibility to surface the actual
     // error to the user via mark_disconnected.
     async fn record_failure(
-        app: &AppHandle,
+        app: &Emit,
         entry: &MonitorEntry,
         node_name: &str,
         threshold: u32,
@@ -421,7 +428,7 @@ async fn run_poller(
 
     // Recovery event: one-shot when we go from outage_since=Some → None.
     async fn record_recovery(
-        app: &AppHandle,
+        app: &Emit,
         entry: &MonitorEntry,
         node_name: &str,
         notify: bool,
@@ -566,7 +573,7 @@ async fn run_poller(
     mark_disconnected(&app, &entry, None).await;
 }
 
-async fn mark_connected(app: &AppHandle, entry: &MonitorEntry) {
+async fn mark_connected(app: &Emit, entry: &MonitorEntry) {
     {
         let mut s = entry.state.lock().await;
         s.connected = true;
@@ -578,7 +585,7 @@ async fn mark_connected(app: &AppHandle, entry: &MonitorEntry) {
     );
 }
 
-async fn mark_disconnected(app: &AppHandle, entry: &MonitorEntry, err: Option<String>) {
+async fn mark_disconnected(app: &Emit, entry: &MonitorEntry, err: Option<String>) {
     let already = {
         let s = entry.state.lock().await;
         !s.connected && s.last_error == err

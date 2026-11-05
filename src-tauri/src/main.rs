@@ -10,5 +10,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // `submarine serve [--port N] [--bind ADDR] [--data-dir P] [--frontend-dir P]`
+    // runs the headless gateway (Epic A) instead of the desktop WebView app.
+    // The bin target is desktop-only (Android builds the cdylib), so no
+    // cfg-gating is needed here — `serve` itself is gated in lib.rs.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("serve") {
+        submarine_lib::serve::run_serve(args.collect());
+        return;
+    }
     submarine_lib::run();
 }

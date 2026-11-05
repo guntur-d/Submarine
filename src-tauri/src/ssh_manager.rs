@@ -2,7 +2,6 @@ use russh::client;
 use russh_keys::key::PublicKey;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use async_trait::async_trait;
 
@@ -33,7 +32,7 @@ pub struct PtySize {
 /// whole terminal tab until it was closed. Batching cuts the event count, and
 /// base64 (~1.33x) keeps each payload compact. Bytes are sent (not a decoded
 /// string) so xterm can buffer a multibyte sequence split across batches.
-pub fn emit_terminal_batch(app: &AppHandle, terminal_id: &str, buf: &mut Vec<u8>) {
+pub fn emit_terminal_batch(app: &crate::Emit, terminal_id: &str, buf: &mut Vec<u8>) {
     if buf.is_empty() {
         return;
     }
@@ -114,7 +113,7 @@ impl SshState {
 }
 
 pub struct ClientHandler {
-    pub app: AppHandle,
+    pub app: crate::Emit,
     pub session_id: String,
     /// Per-connect-attempt random nonce. Used as the key for the
     /// fingerprint-approval oneshot channel so a stale "accept" from a

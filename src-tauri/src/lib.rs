@@ -22,6 +22,10 @@ mod mirror;
 mod docker;
 mod hlc;
 mod identity;
+mod emit;
+pub(crate) use emit::Emit;
+#[cfg(not(target_os = "android"))]
+pub mod serve;
 use ssh_manager::SshState;
 use monitor::{MonitorMap, SharedSettings};
 use mirror::MirrorMap;
@@ -64,6 +68,13 @@ pub struct DbState {
     /// same clock instance backs both the SQL function and any Rust-side sync
     /// code (the merge engine's `observe`).
     pub hlc: StdMutex<Option<std::sync::Arc<hlc::Hlc>>>,
+}
+
+// Fresh state for a process that owns no profile yet. `run()` hands this to
+// `.manage(...)`; `serve` mode builds its own copy the same way, so both
+// runtimes start from identical empty state without duplicating the literal.
+pub(crate) fn new_db_state() -> DbState {
+    DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None) }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,14 +353,13 @@ fn get_or_create_dek(conn: &Connection) -> Result<([u8; 32], bool), String> {
 /// so it never travels when a vault is copied/restored to another device (two
 /// devices sharing a node id would make HLC tie-breaks collide and corrupt the
 /// causal order).
-fn sync_device_node_id(app: &tauri::AppHandle) -> String {
-    use tauri::Manager as _;
+fn sync_device_node_id(data_dir: &std::path::Path) -> String {
     let fresh = || {
         let mut b = [0u8; 8];
         rand::thread_rng().fill(&mut b);
         hex::encode(b)
     };
-    let Ok(dir) = app.path().app_data_dir() else { return fresh() };
+    let dir = data_dir;
     let path = dir.join("sync_device.json");
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -1905,7 +1915,7 @@ async fn restore_personal_profile(
         // No strength floor here: the escrow above already proved this is the
         // profile's real password. A pre-existing short one must still restore.
         if let Err(e) =
-            setup_master_db_inner(app.clone(), vault_password, app.state::<DbState>(), false).await
+            setup_master_db_inner(&app.path().app_data_dir().map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?, vault_password, &app.state::<DbState>(), false).await
         {
             discard_half_built_profile(&app, &local_name);
             return Err(e);
@@ -2762,10 +2772,10 @@ async fn save_vault_async(state: &DbState) -> Result<(), String> {
     .map_err(|e| format!("[CRYPTO] VAULT_JOIN: {}", e))?
 }
 
-/// Returns the list of available profile names (sorted, lowercased not enforced).
-#[tauri::command]
-async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, String> {
-    let dir = profiles_dir(&app_handle)?;
+/// Inner profile listing over an explicit data dir. The Tauri command below
+/// and `serve` mode both funnel here — same listing logic, no duplication.
+async fn list_profiles_inner(data_dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let dir = data_dir.join("profiles");
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -2786,6 +2796,15 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, Stri
     }
     out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
     Ok(out)
+}
+
+/// Tauri command shell: resolves the data dir from the AppHandle (preserving
+/// the original `[SYSTEM] APP_DATA_DIR_NOT_FOUND` error) and delegates.
+#[tauri::command]
+async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let data_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
+    list_profiles_inner(&data_dir).await
 }
 
 /// List the caller's CLOUD profiles (from the per-entity sync store) so the
@@ -2874,15 +2893,25 @@ async fn force_push_profile(
 /// whether the profile's encrypted file already exists (caller uses this
 /// to decide between "ask for password" and "this profile is empty / not
 /// yet created" flows).
+/// Marks a profile as active without opening it — the unlock step
+/// (`setup_master_db`) follows separately. Same data-dir seam as the other
+/// profile-path commands.
+async fn select_profile_inner(data_dir: &std::path::Path, state: &DbState, name: String) -> Result<bool, String> {
+    validate_profile_name(&name)?;
+    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
+    Ok(data_dir.join("profiles").join(format!("{}.submarine", name)).exists())
+}
+
+/// Tauri command shell: resolves the data dir from the AppHandle and delegates.
 #[tauri::command]
 async fn select_profile(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, DbState>,
     name: String,
 ) -> Result<bool, String> {
-    validate_profile_name(&name)?;
-    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
-    Ok(profile_path(&app_handle, &name)?.exists())
+    let data_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
+    select_profile_inner(&data_dir, &state, name).await
 }
 
 /// Drop in-memory state so the UI can return to the profile picker without
@@ -2892,10 +2921,10 @@ async fn select_profile(
 /// previous profile would survive the switch and (worse) attribute any
 /// `known_hosts` writes they triggered to the NEXT profile's DB.
 #[tauri::command]
-async fn close_profile(
-    state: tauri::State<'_, DbState>,
-    ssh: tauri::State<'_, SshState>,
-    monitor_map: tauri::State<'_, MonitorMap>,
+async fn close_profile_inner(
+    state: &DbState,
+    ssh: &SshState,
+    monitor_map: &MonitorMap,
 ) -> Result<(), String> {
     // 0. Persist any accumulated in-memory changes (chief among them:
     // cmd_history rows written by TerminalView's Enter-key handler, which
@@ -2903,12 +2932,12 @@ async fn close_profile(
     // isn't in a saveable state (partial init, crypto error) just log via
     // the returned Err and continue teardown — losing recent history is
     // preferable to leaking session state.
-    let _ = save_vault_async(&state).await;
+    let _ = save_vault_async(state).await;
 
     // 1. Stop monitor pollers. Flip `paused` first so the next loop iteration
     // releases the SSH handle, then drop the map so the Arc strong_count
     // falls to 1 and the poller exits.
-    monitor::pause_all(monitor_map.inner().clone()).await;
+    monitor::pause_all(Arc::clone(monitor_map)).await;
     monitor_map.lock().await.clear();
 
     // 2. Collect every active session id, then run the standard
@@ -2975,19 +3004,37 @@ async fn close_profile(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared teardown.
+#[tauri::command]
+async fn close_profile(
+    state: tauri::State<'_, DbState>,
+    ssh: tauri::State<'_, SshState>,
+    monitor_map: tauri::State<'_, MonitorMap>,
+) -> Result<(), String> {
+    close_profile_inner(&state, &ssh, &monitor_map).await
+}
+
 /// Permanently delete a profile's encrypted file. The caller must NOT be
 /// "in" that profile (would orphan in-memory state pointing at a deleted
 /// file). UI enforces this by only showing the delete button on the picker
 /// screen.
-#[tauri::command]
-async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
+async fn delete_profile_inner(data_dir: &std::path::Path, name: String) -> Result<(), String> {
     validate_profile_name(&name)?;
-    let path = profile_path(&app_handle, &name)?;
+    let path = data_dir.join("profiles").join(format!("{}.submarine", name));
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|e| format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e))?;
     }
     Ok(())
+}
+
+/// Tauri command shell: resolves the data dir from the AppHandle (preserving
+/// the original `[SYSTEM] APP_DATA_DIR_NOT_FOUND` error) and delegates.
+#[tauri::command]
+async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
+    let data_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
+    delete_profile_inner(&data_dir, name).await
 }
 
 /// Copy a profile's encrypted file to a user-chosen location so it can be
@@ -3139,16 +3186,27 @@ async fn import_profile_save(
 /// Whether the *currently selected* profile's encrypted file exists on
 /// disk. Returns false if no profile is selected — that signals the UI to
 /// stay on the picker instead of jumping to the password prompt.
+/// Inner existence check over an explicit data dir. Same split pattern as
+/// `list_profiles_inner` — the Tauri shell below preserves the original
+/// `[SYSTEM] APP_DATA_DIR_NOT_FOUND` mapping.
+async fn check_db_exists_inner(data_dir: &std::path::Path, state: &DbState) -> Result<bool, String> {
+    let name = state.active_profile.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?
+        .clone();
+    let Some(name) = name else { return Ok(false) };
+    Ok(data_dir.join("profiles").join(format!("{}.submarine", name)).exists())
+}
+
+/// Tauri command shell: resolves the data dir from the AppHandle (preserving
+/// the original error mapping) and delegates.
 #[tauri::command]
 async fn check_db_exists(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, DbState>,
 ) -> Result<bool, String> {
-    let name = state.active_profile.lock()
-        .map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?
-        .clone();
-    let Some(name) = name else { return Ok(false) };
-    Ok(profile_path(&app_handle, &name)?.exists())
+    let data_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
+    check_db_exists_inner(&data_dir, &state).await
 }
 
 #[tauri::command]
@@ -3157,7 +3215,9 @@ async fn setup_master_db(app_handle: tauri::AppHandle, password: String, state: 
     // (create a profile, or unlock an existing one), so the strength floor
     // applies. `restore_personal_profile` is the one caller that doesn't get to
     // choose — see `enforce_strength` below.
-    setup_master_db_inner(app_handle, password, state, true).await
+    let data_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
+    setup_master_db_inner(&data_dir, password, &state, true).await
 }
 
 /// `enforce_strength = false` is for restoring a profile that ALREADY exists in
@@ -3167,9 +3227,9 @@ async fn setup_master_db(app_handle: tauri::AppHandle, password: String, state: 
 /// new device while the old device keeps opening it fine. The floor belongs on
 /// creation, where the choice is actually being made.
 async fn setup_master_db_inner(
-    app_handle: tauri::AppHandle,
+    data_dir: &std::path::Path,
     mut password: String,
-    state: tauri::State<'_, DbState>,
+    state: &DbState,
     enforce_strength: bool,
 ) -> Result<(), String> {
     // The active profile must be picked before this command — the UI does
@@ -3180,12 +3240,12 @@ async fn setup_master_db_inner(
         .clone()
         .ok_or("[STATE] NO_PROFILE_SELECTED")?;
 
-    let dir = profiles_dir(&app_handle)?;
+    let dir = data_dir.join("profiles");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("[FILE] DIR_CREATION_FAILED: {}", e))?;
     }
 
-    let path = profile_path(&app_handle, &profile_name)?;
+    let path = dir.join(format!("{}.submarine", profile_name));
     let mut conn;
     let salt_bytes: [u8; SALT_LEN];
     // Wrap the derived AES key so it's wiped on every early-return path
@@ -3428,7 +3488,7 @@ async fn setup_master_db_inner(
     // every row mutation auto-stamps `updated_at`. Seed the clock past the
     // newest stamp already in the vault so a freshly-started process never
     // issues one that sorts before data it already holds.
-    let sync_node_id = sync_device_node_id(&app_handle);
+    let sync_node_id = sync_device_node_id(data_dir);
     let seed_ms: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(updated_at),'') FROM (
@@ -3496,7 +3556,7 @@ async fn setup_master_db_inner(
     drop(conn_guard);
 
     if needs_resave {
-        save_vault_internal(&state)?;
+        save_vault_internal(state)?;
     }
     Ok(())
 }
@@ -3505,9 +3565,14 @@ async fn setup_master_db_inner(
 /// SSH connection so any `known_hosts` row that `check_server_key` inserted
 /// during the handshake survives an app restart — otherwise the user would
 /// see the same fingerprint prompt every time they reconnect.
+async fn persist_vault_inner(state: &DbState) -> Result<(), String> {
+    save_vault_async(state).await
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
 async fn persist_vault(state: tauri::State<'_, DbState>) -> Result<(), String> {
-    save_vault_async(&state).await
+    persist_vault_inner(&state).await
 }
 
 /// Create a brand-new profile, encrypted with `password`, and select it as
@@ -3516,10 +3581,9 @@ async fn persist_vault(state: tauri::State<'_, DbState>) -> Result<(), String> {
 /// Rejected if a profile with the same name already exists — the picker
 /// surfaces existing names so a clobber would be the user's mistake to
 /// recover from, not something we should silently do.
-#[tauri::command]
-async fn create_profile(
-    app_handle: tauri::AppHandle,
-    state: tauri::State<'_, DbState>,
+async fn create_profile_inner(
+    data_dir: &std::path::Path,
+    state: &DbState,
     name: String,
     password: String,
 ) -> Result<(), String> {
@@ -3527,16 +3591,16 @@ async fn create_profile(
     if password.is_empty() {
         return Err("Password cannot be empty".into());
     }
-    let dir = profiles_dir(&app_handle)?;
+    let dir = data_dir.join("profiles");
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    let path = profile_path(&app_handle, &name)?;
+    let path = dir.join(format!("{}.submarine", name));
     if path.exists() {
         return Err(format!("Profile '{}' already exists", name));
     }
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
     // Reuse setup_master_db's fresh-schema branch by deferring to it. Empty
     // profile starts with the same migrations the legacy path would do.
-    setup_master_db(app_handle.clone(), password, state).await?;
+    setup_master_db_inner(data_dir, password, state, true).await?;
 
     // New profile: mint a stable UUID and partition its cloud sync by that UUID
     // rather than its name. Two vaults that happen to share a display name then
@@ -3544,9 +3608,8 @@ async fn create_profile(
     // failures, no silently merged records. Legacy `main` predates this and
     // keeps its name partition (untouched); only profiles born here get a UUID.
     // The human-readable name still reaches the server via sync_now's `name`.
-    let db_state = app_handle.state::<DbState>();
     {
-        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn_g = state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         let mut pid = [0u8; 16];
         rand::thread_rng().fill(&mut pid);
@@ -3564,12 +3627,25 @@ async fn create_profile(
         )
         .map_err(|e| format!("[STATE] CLOUD_PROFILE_STORE: {e}"))?;
     }
-    save_vault_internal(&db_state)?;
+    save_vault_internal(state)?;
     Ok(())
 }
 
+/// Tauri command shell: resolves the data dir from the AppHandle (preserving
+/// the original `[SYSTEM] APP_DATA_DIR_NOT_FOUND` error) and delegates.
 #[tauri::command]
-async fn generate_ssh_key(state: tauri::State<'_, DbState>, name: String) -> Result<(), String> {
+async fn create_profile(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    name: String,
+    password: String,
+) -> Result<(), String> {
+    let data_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
+    create_profile_inner(&data_dir, &state, name, password).await
+}
+
+async fn generate_ssh_key_inner(state: &DbState, name: String) -> Result<(), String> {
     let keypair = Ed25519Keypair::random(&mut OsRng);
     let priv_key = PrivateKey::from(keypair);
     let pub_ssh = priv_key.public_key().to_openssh()
@@ -3586,6 +3662,11 @@ async fn generate_ssh_key(state: tauri::State<'_, DbState>, name: String) -> Res
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(())
+}
+/// Tauri command shell — unwraps managed state and delegates to `generate_ssh_key_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn generate_ssh_key(state: tauri::State<'_, DbState>, name: String) -> Result<(), String> {
+    generate_ssh_key_inner(&state, name).await
 }
 
 /// Reject key formats the SSH client cannot use, so failures surface when the
@@ -3646,8 +3727,7 @@ fn validate_ssh_private_key(private_key: &str) -> Result<(), String> {
     Err("[SSH] UNRECOGNIZED_KEY_FORMAT: Expected an OpenSSH-format private key (begins with -----BEGIN OPENSSH PRIVATE KEY-----) or RSA PEM.".into())
 }
 
-#[tauri::command]
-async fn add_ssh_key(state: tauri::State<'_, DbState>, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
+async fn add_ssh_key_inner(state: &DbState, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
     validate_ssh_private_key(&private_key)?;
 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -3660,9 +3740,13 @@ async fn add_ssh_key(state: tauri::State<'_, DbState>, name: String, public_key:
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `add_ssh_key_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn edit_ssh_key(state: tauri::State<'_, DbState>, id: i32, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
+async fn add_ssh_key(state: tauri::State<'_, DbState>, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
+    add_ssh_key_inner(&state, name, public_key, private_key, passphrase).await
+}
+
+async fn edit_ssh_key_inner(state: &DbState, id: i32, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
     validate_ssh_private_key(&private_key)?;
 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -3675,9 +3759,13 @@ async fn edit_ssh_key(state: tauri::State<'_, DbState>, id: i32, name: String, p
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `edit_ssh_key_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn delete_ssh_key(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+async fn edit_ssh_key(state: tauri::State<'_, DbState>, id: i32, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
+    edit_ssh_key_inner(&state, id, name, public_key, private_key, passphrase).await
+}
+
+async fn delete_ssh_key_inner(state: &DbState, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -3687,6 +3775,11 @@ async fn delete_ssh_key(state: tauri::State<'_, DbState>, id: i32) -> Result<(),
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(())
+}
+/// Tauri command shell — unwraps managed state and delegates to `delete_ssh_key_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn delete_ssh_key(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+    delete_ssh_key_inner(&state, id).await
 }
 
 /// Canonicalize a node row's identity fields based on the chosen auth_type.
@@ -3720,9 +3813,8 @@ fn normalize_server_identity(
     }
 }
 
-#[tauri::command]
-async fn add_server(
-    state: tauri::State<'_, DbState>,
+async fn add_server_inner(
+    state: &DbState,
     name: String,
     host: String,
     port: i32,
@@ -3779,6 +3871,29 @@ async fn add_server(
     save_vault_internal(&state)?;
     Ok(new_id)
 }
+/// Tauri command shell — unwraps managed state and delegates to `add_server_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn add_server(
+    state: tauri::State<'_, DbState>,
+    name: String,
+    host: String,
+    port: i32,
+    username: Option<String>,
+    password: Option<String>,
+    credential_id: Option<i32>,
+    folder_id: Option<i32>,
+    proxy_type: String,
+    proxy_host: String,
+    proxy_port: i32,
+    tunnels: Vec<serde_json::Value>,
+    auth_type: String,
+    key_id: Option<i32>,
+    autostart: Option<bool>,
+    mirrors: Option<Vec<serde_json::Value>>,
+    color: Option<String>,
+) -> Result<i64, String> {
+    add_server_inner(&state, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color).await
+}
 
 /// Persist a Quick Connect target as a reusable node in the ROOT directory
 /// (folder_id NULL). Quick Connect is otherwise ephemeral; this leaves behind a
@@ -3790,9 +3905,8 @@ async fn add_server(
 /// into `ssh_keys` (public_key left empty — the connect path derives everything
 /// it needs from the private key via decode_secret_key, see the custom_key
 /// branch in initiate_connection) and reference it as `custom_key`.
-#[tauri::command]
-async fn save_quick_connect_node(
-    state: tauri::State<'_, DbState>,
+async fn save_quick_connect_node_inner(
+    state: &DbState,
     auth: QuickAuth,
 ) -> Result<i64, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -3848,11 +3962,18 @@ async fn save_quick_connect_node(
     save_vault_internal(&state)?;
     Ok(new_id)
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `save_quick_connect_node_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn edit_server(
+async fn save_quick_connect_node(
     state: tauri::State<'_, DbState>,
-    ssh_state: tauri::State<'_, SshState>,
+    auth: QuickAuth,
+) -> Result<i64, String> {
+    save_quick_connect_node_inner(&state, auth).await
+}
+
+async fn edit_server_inner(
+    state: &DbState,
+    ssh_state: &SshState,
     id: i32,
     name: String,
     host: String,
@@ -3959,6 +4080,46 @@ async fn edit_server(
     }
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `edit_server_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn edit_server(
+    state: tauri::State<'_, DbState>,
+    ssh_state: tauri::State<'_, SshState>,
+    id: i32,
+    name: String,
+    host: String,
+    port: i32,
+    username: Option<String>,
+    password: Option<String>,
+    credential_id: Option<i32>,
+    folder_id: Option<i32>,
+    proxy_type: String,
+    proxy_host: String,
+    proxy_port: i32,
+    tunnels: Vec<serde_json::Value>,
+    auth_type: String,
+    key_id: Option<i32>,
+    autostart: Option<bool>,
+    mirrors: Option<Vec<serde_json::Value>>,
+    color: Option<String>,
+    // Frontend opt-out for password persistence. When the user opens the
+    // edit sheet, we call `reveal_server_password` to populate the form;
+    // if that call ever fails (transient DB error / migration mid-flight)
+    // the form would have a blank password and a naive save would wipe
+    // the stored secret. The frontend sends `preserve_password=true`
+    // whenever the password field wasn't touched, and the SQL below uses
+    // COALESCE(?, password) so the existing column survives.
+    preserve_password: Option<bool>,
+) -> Result<(), String> {
+    edit_server_inner(&state, &ssh_state, id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, // Frontend opt-out for password persistence. When the user opens the
+    // edit sheet, we call `reveal_server_password` to populate the form;
+    // if that call ever fails (transient DB error / migration mid-flight)
+    // the form would have a blank password and a naive save would wipe
+    // the stored secret. The frontend sends `preserve_password=true`
+    // whenever the password field wasn't touched, and the SQL below uses
+    // COALESCE(?, password) so the existing column survives.
+    preserve_password).await
+}
 
 /// Append a single mirror spec to a saved server's mirrors column.
 ///
@@ -3969,9 +4130,8 @@ async fn edit_server(
 /// re-encrypting the vault on the way out, the same as the full edit
 /// path does. Duplicate (local, remote) entries are coalesced so
 /// hitting "Start mirror" twice on the same pair doesn't bloat the row.
-#[tauri::command]
-async fn add_mirror_to_server(
-    state: tauri::State<'_, DbState>,
+async fn add_mirror_to_server_inner(
+    state: &DbState,
     server_id: i32,
     mirror: serde_json::Value,
 ) -> Result<(), String> {
@@ -4009,13 +4169,21 @@ async fn add_mirror_to_server(
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `add_mirror_to_server_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn add_mirror_to_server(
+    state: tauri::State<'_, DbState>,
+    server_id: i32,
+    mirror: serde_json::Value,
+) -> Result<(), String> {
+    add_mirror_to_server_inner(&state, server_id, mirror).await
+}
 
 /// Reveal the plaintext password for a single server row. Used by the edit
 /// panel — only the row the user is editing has its secret crossing IPC.
 /// Returns `Ok(None)` if the server uses a vault credential (no inline
 /// password) or the password column is empty.
-#[tauri::command]
-async fn reveal_server_password(state: tauri::State<'_, DbState>, id: i32) -> Result<Option<String>, String> {
+async fn reveal_server_password_inner(state: &DbState, id: i32) -> Result<Option<String>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.query_row(
@@ -4024,11 +4192,15 @@ async fn reveal_server_password(state: tauri::State<'_, DbState>, id: i32) -> Re
         |row| row.get::<_, Option<String>>(0),
     ).map_err(|e| format!("[DATABASE] REVEAL_FAILED: {}", e))
 }
+/// Tauri command shell — unwraps managed state and delegates to `reveal_server_password_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn reveal_server_password(state: tauri::State<'_, DbState>, id: i32) -> Result<Option<String>, String> {
+    reveal_server_password_inner(&state, id).await
+}
 
 /// Reveal the plaintext password for a single saved credential. Same shape
 /// and rationale as `reveal_server_password`.
-#[tauri::command]
-async fn reveal_credential_password(state: tauri::State<'_, DbState>, id: i32) -> Result<Option<String>, String> {
+async fn reveal_credential_password_inner(state: &DbState, id: i32) -> Result<Option<String>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.query_row(
@@ -4037,12 +4209,16 @@ async fn reveal_credential_password(state: tauri::State<'_, DbState>, id: i32) -
         |row| row.get::<_, Option<String>>(0),
     ).map_err(|e| format!("[DATABASE] REVEAL_FAILED: {}", e))
 }
+/// Tauri command shell — unwraps managed state and delegates to `reveal_credential_password_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn reveal_credential_password(state: tauri::State<'_, DbState>, id: i32) -> Result<Option<String>, String> {
+    reveal_credential_password_inner(&state, id).await
+}
 
 /// Reveal the stored private key + passphrase for an SSH key entry. Used
 /// by the key editor and by any future "show key" affordance. The list
 /// view never sees these fields.
-#[tauri::command]
-async fn reveal_ssh_key(state: tauri::State<'_, DbState>, id: i32) -> Result<serde_json::Value, String> {
+async fn reveal_ssh_key_inner(state: &DbState, id: i32) -> Result<serde_json::Value, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.query_row(
@@ -4056,12 +4232,16 @@ async fn reveal_ssh_key(state: tauri::State<'_, DbState>, id: i32) -> Result<ser
         },
     ).map_err(|e| format!("[DATABASE] REVEAL_FAILED: {}", e))
 }
+/// Tauri command shell — unwraps managed state and delegates to `reveal_ssh_key_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn reveal_ssh_key(state: tauri::State<'_, DbState>, id: i32) -> Result<serde_json::Value, String> {
+    reveal_ssh_key_inner(&state, id).await
+}
 
 /// Light-weight colour write — used by the NodeGrid swatch picker so the
 /// caller doesn't have to round-trip the whole edit_server payload just to
 /// change one tag. Pass `None` to clear back to the default ring.
-#[tauri::command]
-async fn set_server_color(state: tauri::State<'_, DbState>, id: i32, color: Option<String>) -> Result<(), String> {
+async fn set_server_color_inner(state: &DbState, id: i32, color: Option<String>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute(
@@ -4072,6 +4252,11 @@ async fn set_server_color(state: tauri::State<'_, DbState>, id: i32, color: Opti
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `set_server_color_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn set_server_color(state: tauri::State<'_, DbState>, id: i32, color: Option<String>) -> Result<(), String> {
+    set_server_color_inner(&state, id, color).await
+}
 
 /// Persist a manual drag-to-reorder of the node grid. `ids` is the full list
 /// of server ids in their new visual order (typically the servers of one
@@ -4081,8 +4266,7 @@ async fn set_server_color(state: tauri::State<'_, DbState>, id: i32, color: Opti
 /// like any other edited field. Writing 0..n only for the passed ids is safe:
 /// positions are compared within a folder after `get_servers` filters, and id
 /// breaks any cross-folder ties.
-#[tauri::command]
-async fn reorder_servers(state: tauri::State<'_, DbState>, ids: Vec<i32>) -> Result<(), String> {
+async fn reorder_servers_inner(state: &DbState, ids: Vec<i32>) -> Result<(), String> {
     {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -4102,9 +4286,13 @@ async fn reorder_servers(state: tauri::State<'_, DbState>, ids: Vec<i32>) -> Res
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `reorder_servers_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn set_folder_color(state: tauri::State<'_, DbState>, id: i32, color: Option<String>) -> Result<(), String> {
+async fn reorder_servers(state: tauri::State<'_, DbState>, ids: Vec<i32>) -> Result<(), String> {
+    reorder_servers_inner(&state, ids).await
+}
+
+async fn set_folder_color_inner(state: &DbState, id: i32, color: Option<String>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute(
@@ -4115,12 +4303,16 @@ async fn set_folder_color(state: tauri::State<'_, DbState>, id: i32, color: Opti
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `set_folder_color_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn set_folder_color(state: tauri::State<'_, DbState>, id: i32, color: Option<String>) -> Result<(), String> {
+    set_folder_color_inner(&state, id, color).await
+}
 
 /// Update the free-form notes / description blob attached to a node. Stored
 /// as plain text in the `notes` column; the UI renders it monospace and lets
 /// the user dump runbook snippets, contact info, alerts to remember, etc.
-#[tauri::command]
-async fn set_server_notes(state: tauri::State<'_, DbState>, id: i32, notes: String) -> Result<(), String> {
+async fn set_server_notes_inner(state: &DbState, id: i32, notes: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute(
@@ -4131,14 +4323,18 @@ async fn set_server_notes(state: tauri::State<'_, DbState>, id: i32, notes: Stri
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `set_server_notes_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn set_server_notes(state: tauri::State<'_, DbState>, id: i32, notes: String) -> Result<(), String> {
+    set_server_notes_inner(&state, id, notes).await
+}
 
 /// Per-server commands auto-typed into the first terminal on initial connect.
 /// Stored as a single blob (newline-separated lines); the frontend sends them
 /// only for `-term-0` and only on the first open, never on reconnect. Written
 /// through its own command (like set_server_notes) so it doesn't have to be
 /// threaded through add_server / edit_server's positional parameter lists.
-#[tauri::command]
-async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, value: String) -> Result<(), String> {
+async fn set_server_run_on_connect_inner(state: &DbState, id: i32, value: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute(
@@ -4149,13 +4345,17 @@ async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, va
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `set_server_run_on_connect_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, value: String) -> Result<(), String> {
+    set_server_run_on_connect_inner(&state, id, value).await
+}
 
 /// ProxyJump target for a node: `Some(other_server_id)` to bounce through that
 /// server, or `None` to connect directly. Written through its own command
 /// (like set_server_notes / set_server_run_on_connect) so it stays out of
 /// add_server / edit_server's positional parameter lists.
-#[tauri::command]
-async fn set_server_jump_host(state: tauri::State<'_, DbState>, id: i32, value: Option<i32>) -> Result<(), String> {
+async fn set_server_jump_host_inner(state: &DbState, id: i32, value: Option<i32>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute(
@@ -4166,14 +4366,18 @@ async fn set_server_jump_host(state: tauri::State<'_, DbState>, id: i32, value: 
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `set_server_jump_host_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn set_server_jump_host(state: tauri::State<'_, DbState>, id: i32, value: Option<i32>) -> Result<(), String> {
+    set_server_jump_host_inner(&state, id, value).await
+}
 
 /// Duplicate a server row verbatim — including credentials linkage, tunnels,
 /// mirrors, proxy config, colour. The clone gets a "{name} (copy)" suffix so
 /// it shows up beside the original in the grid; everything else is identical
 /// so the user can connect to the same target with a different label or
 /// tweak one field without retyping the rest.
-#[tauri::command]
-async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, String> {
+async fn clone_server_inner(state: &DbState, id: i32) -> Result<i64, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     let affected = conn.execute(
@@ -4198,11 +4402,15 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
     save_vault_internal(&state)?;
     Ok(new_id)
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `clone_server_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn delete_server(
-    state: tauri::State<'_, DbState>,
-    map: tauri::State<'_, MonitorMap>,
+async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, String> {
+    clone_server_inner(&state, id).await
+}
+
+async fn delete_server_inner(
+    state: &DbState,
+    map: &MonitorMap,
     id: i32,
 ) -> Result<(), String> {
     // Stop the poller BEFORE the row goes away. The monitor_configs row does
@@ -4213,7 +4421,7 @@ async fn delete_server(
     // vanishes from the UI and monitor_remove (the only other caller of
     // stop_monitor) can no longer be invoked for it. Only an app restart
     // stopped it.
-    monitor::stop_monitor(map.inner().clone(), id).await;
+    monitor::stop_monitor(Arc::clone(map), id).await;
 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -4225,9 +4433,20 @@ async fn delete_server(
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `delete_server_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+async fn delete_server(
+    state: tauri::State<'_, DbState>,
+    map: tauri::State<'_, MonitorMap>,
+    id: i32,
+) -> Result<(), String> {
+    delete_server_inner(&state, &map, id).await
+}
+
+/// Inner server listing over a borrowed `DbState`. The Tauri command below
+/// and `serve` mode both funnel here — the body is untouched; `State` derefs
+/// to `&DbState`, so the wrapper passes `&state` with no other changes.
+async fn get_servers_inner(state: &DbState) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     // Secrets stay server-side: this listing returns `has_password` instead
@@ -4279,8 +4498,14 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
+/// Tauri command shell: unwraps `State` (deref coercion gives `&DbState`)
+/// and delegates. Behaviour identical to before the split.
 #[tauri::command]
-async fn get_ssh_keys(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    get_servers_inner(&state).await
+}
+
+async fn get_ssh_keys_inner(state: &DbState) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     // Private key + passphrase do NOT cross IPC in the listing — only the
@@ -4306,8 +4531,13 @@ async fn get_ssh_keys(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json
     Ok(list)
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn get_credentials(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+async fn get_ssh_keys(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    get_ssh_keys_inner(&state).await
+}
+
+async fn get_credentials_inner(state: &DbState) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     // Same pattern as get_servers / get_ssh_keys: only `has_password` is
@@ -4333,8 +4563,13 @@ async fn get_credentials(state: tauri::State<'_, DbState>) -> Result<Vec<serde_j
     Ok(list)
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn add_credential(state: tauri::State<'_, DbState>, name: String, auth_type: String, username: String, password: Option<String>, key_id: Option<i32>) -> Result<(), String> {
+async fn get_credentials(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    get_credentials_inner(&state).await
+}
+
+async fn add_credential_inner(state: &DbState, name: String, auth_type: String, username: String, password: Option<String>, key_id: Option<i32>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4345,9 +4580,13 @@ async fn add_credential(state: tauri::State<'_, DbState>, name: String, auth_typ
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `add_credential_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn edit_credential(state: tauri::State<'_, DbState>, id: i32, name: String, auth_type: String, username: String, password: Option<String>, key_id: Option<i32>) -> Result<(), String> {
+async fn add_credential(state: tauri::State<'_, DbState>, name: String, auth_type: String, username: String, password: Option<String>, key_id: Option<i32>) -> Result<(), String> {
+    add_credential_inner(&state, name, auth_type, username, password, key_id).await
+}
+
+async fn edit_credential_inner(state: &DbState, id: i32, name: String, auth_type: String, username: String, password: Option<String>, key_id: Option<i32>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4358,9 +4597,13 @@ async fn edit_credential(state: tauri::State<'_, DbState>, id: i32, name: String
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `edit_credential_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn delete_credential(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+async fn edit_credential(state: tauri::State<'_, DbState>, id: i32, name: String, auth_type: String, username: String, password: Option<String>, key_id: Option<i32>) -> Result<(), String> {
+    edit_credential_inner(&state, id, name, auth_type, username, password, key_id).await
+}
+
+async fn delete_credential_inner(state: &DbState, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4371,9 +4614,13 @@ async fn delete_credential(state: tauri::State<'_, DbState>, id: i32) -> Result<
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `delete_credential_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn add_folder(state: tauri::State<'_, DbState>, name: String, parent_id: Option<i32>) -> Result<(), String> {
+async fn delete_credential(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+    delete_credential_inner(&state, id).await
+}
+
+async fn add_folder_inner(state: &DbState, name: String, parent_id: Option<i32>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4386,9 +4633,13 @@ async fn add_folder(state: tauri::State<'_, DbState>, name: String, parent_id: O
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `add_folder_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn rename_folder(state: tauri::State<'_, DbState>, id: i32, name: String) -> Result<(), String> {
+async fn add_folder(state: tauri::State<'_, DbState>, name: String, parent_id: Option<i32>) -> Result<(), String> {
+    add_folder_inner(&state, name, parent_id).await
+}
+
+async fn rename_folder_inner(state: &DbState, id: i32, name: String) -> Result<(), String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("[VALIDATION] FOLDER_NAME_EMPTY".into());
@@ -4406,11 +4657,15 @@ async fn rename_folder(state: tauri::State<'_, DbState>, id: i32, name: String) 
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `rename_folder_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn delete_folder(
-    state: tauri::State<'_, DbState>,
-    map: tauri::State<'_, MonitorMap>,
+async fn rename_folder(state: tauri::State<'_, DbState>, id: i32, name: String) -> Result<(), String> {
+    rename_folder_inner(&state, id, name).await
+}
+
+async fn delete_folder_inner(
+    state: &DbState,
+    map: &MonitorMap,
     id: i32,
 ) -> Result<(), String> {
     // Same orphaned-poller problem as delete_server, one level up: this deletes
@@ -4428,7 +4683,7 @@ async fn delete_folder(
         rows.filter_map(|r| r.ok()).collect()
     };
     for node_id in doomed {
-        monitor::stop_monitor(map.inner().clone(), node_id).await;
+        monitor::stop_monitor(Arc::clone(map), node_id).await;
     }
 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -4446,9 +4701,17 @@ async fn delete_folder(
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `delete_folder_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn get_folders(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+async fn delete_folder(
+    state: tauri::State<'_, DbState>,
+    map: tauri::State<'_, MonitorMap>,
+    id: i32,
+) -> Result<(), String> {
+    delete_folder_inner(&state, &map, id).await
+}
+
+async fn get_folders_inner(state: &DbState) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     let mut stmt = conn.prepare("SELECT id, name, parent_id, color FROM folders").map_err(|e| e.to_string())?;
@@ -4469,8 +4732,13 @@ async fn get_folders(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn add_command(state: tauri::State<'_, DbState>, title: String, content: String) -> Result<(), String> {
+async fn get_folders(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    get_folders_inner(&state).await
+}
+
+async fn add_command_inner(state: &DbState, title: String, content: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4483,9 +4751,13 @@ async fn add_command(state: tauri::State<'_, DbState>, title: String, content: S
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `add_command_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn edit_command(state: tauri::State<'_, DbState>, id: i32, title: String, content: String) -> Result<(), String> {
+async fn add_command(state: tauri::State<'_, DbState>, title: String, content: String) -> Result<(), String> {
+    add_command_inner(&state, title, content).await
+}
+
+async fn edit_command_inner(state: &DbState, id: i32, title: String, content: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4498,9 +4770,13 @@ async fn edit_command(state: tauri::State<'_, DbState>, id: i32, title: String, 
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `edit_command_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+async fn edit_command(state: tauri::State<'_, DbState>, id: i32, title: String, content: String) -> Result<(), String> {
+    edit_command_inner(&state, id, title, content).await
+}
+
+async fn delete_command_inner(state: &DbState, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     
@@ -4513,9 +4789,13 @@ async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(),
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `delete_command_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+    delete_command_inner(&state, id).await
+}
+
+async fn get_commands_inner(state: &DbState) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     let mut stmt = conn.prepare("SELECT id, title, content FROM commands").map_err(|e| e.to_string())?;
@@ -4544,9 +4824,14 @@ async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json
 
 const CMD_HISTORY_CAP: i64 = 1000;
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn cmd_history_add(
-    state: tauri::State<'_, DbState>,
+async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    get_commands_inner(&state).await
+}
+
+async fn cmd_history_add_inner(
+    state: &DbState,
     server_id: Option<i32>,
     server_name: String,
     command: String,
@@ -4606,10 +4891,19 @@ async fn cmd_history_add(
     // node edit, key add, etc., or profile-close teardown) picks it up.
     Ok(new_id)
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `cmd_history_add_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn cmd_history_list(
+async fn cmd_history_add(
     state: tauri::State<'_, DbState>,
+    server_id: Option<i32>,
+    server_name: String,
+    command: String,
+) -> Result<i64, String> {
+    cmd_history_add_inner(&state, server_id, server_name, command).await
+}
+
+async fn cmd_history_list_inner(
+    state: &DbState,
     query: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -4673,9 +4967,17 @@ async fn cmd_history_list(
     };
     Ok(rows)
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `cmd_history_list_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn cmd_history_clear(state: tauri::State<'_, DbState>) -> Result<(), String> {
+async fn cmd_history_list(
+    state: tauri::State<'_, DbState>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    cmd_history_list_inner(&state, query, limit).await
+}
+
+async fn cmd_history_clear_inner(state: &DbState) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute("DELETE FROM cmd_history", [])
@@ -4684,6 +4986,11 @@ async fn cmd_history_clear(state: tauri::State<'_, DbState>) -> Result<(), Strin
     save_vault_internal(&state)?;
     Ok(())
 }
+/// Tauri command shell — unwraps managed state and delegates to `cmd_history_clear_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn cmd_history_clear(state: tauri::State<'_, DbState>) -> Result<(), String> {
+    cmd_history_clear_inner(&state).await
+}
 
 // ───────────────────────── Notes ─────────────────────────
 // Free-form text notes stored alongside the rest of the profile. Mirrors the
@@ -4691,8 +4998,7 @@ async fn cmd_history_clear(state: tauri::State<'_, DbState>) -> Result<(), Strin
 // is done client-side over the returned list so the user can match against
 // title and body in one go without us pushing a LIKE query through SQLite.
 
-#[tauri::command]
-async fn add_note(state: tauri::State<'_, DbState>, title: String, body: String) -> Result<(), String> {
+async fn add_note_inner(state: &DbState, title: String, body: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
@@ -4705,9 +5011,13 @@ async fn add_note(state: tauri::State<'_, DbState>, title: String, body: String)
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `add_note_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn edit_note(state: tauri::State<'_, DbState>, id: i32, title: String, body: String) -> Result<(), String> {
+async fn add_note(state: tauri::State<'_, DbState>, title: String, body: String) -> Result<(), String> {
+    add_note_inner(&state, title, body).await
+}
+
+async fn edit_note_inner(state: &DbState, id: i32, title: String, body: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
@@ -4720,9 +5030,13 @@ async fn edit_note(state: tauri::State<'_, DbState>, id: i32, title: String, bod
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `edit_note_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn delete_note(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+async fn edit_note(state: tauri::State<'_, DbState>, id: i32, title: String, body: String) -> Result<(), String> {
+    edit_note_inner(&state, id, title, body).await
+}
+
+async fn delete_note_inner(state: &DbState, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
@@ -4735,9 +5049,13 @@ async fn delete_note(state: tauri::State<'_, DbState>, id: i32) -> Result<(), St
     save_vault_internal(&state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `delete_note_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn get_notes(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+async fn delete_note(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+    delete_note_inner(&state, id).await
+}
+
+async fn get_notes_inner(state: &DbState) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     // Newest first — matches how users think about notes (last-touched up top).
@@ -4758,13 +5076,19 @@ async fn get_notes(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::V
     Ok(list)
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn get_notes(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    get_notes_inner(&state).await
+}
+
 /// One-shot inline auth bundle for "quick connect" — connecting to a host
 /// without saving anything in the vault. Mirrors the subset of node fields
 /// that the connection flow actually needs: address, identity, and either
 /// a password or a PEM key body. Proxy + tunnel auto-start are deliberately
 /// omitted; the user can save a real node if they need those.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct QuickAuth {
+pub(crate) struct QuickAuth {
     host: String,
     port: i32,
     username: String,
@@ -4797,7 +5121,7 @@ struct QuickAuth {
 async fn run_keyboard_interactive<H: russh::client::Handler>(
     session: &mut russh::client::Handle<H>,
     user: &str,
-    app: &tauri::AppHandle,
+    app: &Emit,
     session_id: &str,
     nonce: &str,
     kbi_txs: &std::sync::Arc<
@@ -4807,7 +5131,6 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     >,
 ) -> Option<Result<bool, russh::Error>> {
     use russh::client::KeyboardInteractiveAuthResponse;
-    use tauri::Emitter;
 
     let log = |msg: &str, ty: &str| {
         println!("[LOG-{}] {}", session_id, msg);
@@ -5093,7 +5416,7 @@ fn resolve_jump_auth(
 /// under the target's `session_id`, keyed by a distinct nonce), and it supports
 /// the full key → password → keyboard-interactive auth ladder.
 async fn connect_jump_host(
-    app: &tauri::AppHandle,
+    app: &Emit,
     db: &std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     fp_txs: &std::sync::Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
@@ -5107,7 +5430,6 @@ async fn connect_jump_host(
     jump_server_id: i32,
 ) -> Result<russh::client::Handle<ssh_manager::ClientHandler>, String> {
     use tokio::time::Duration;
-    use tauri::Emitter;
 
     let log = |msg: &str, ty: &str| {
         println!("[LOG-{}] [jump] {}", session_id, msg);
@@ -5270,12 +5592,15 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     }
 }
 
-#[tauri::command]
-async fn initiate_connection(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
-    db_state: tauri::State<'_, DbState>,
-    mirrors: tauri::State<'_, MirrorMap>,
+/// Inner connection driver shared by the desktop Tauri command and `serve`
+/// mode. Takes plain borrows + [`Emit`] instead of Tauri injectables; the
+/// 1100-line body below is untouched apart from the signature and three
+/// mechanical reference fixes.
+async fn initiate_connection_inner(
+    app: Emit,
+    state: &SshState,
+    db_state: &DbState,
+    mirrors: &MirrorMap,
     session_id: String,
     server_id: i32,
     custom_password: Option<String>,
@@ -5290,7 +5615,6 @@ async fn initiate_connection(
     session_role: Option<String>,
     separate_sessions: Option<bool>,
 ) -> Result<(), String> {
-    use tauri::Emitter;
     use tokio::time::Duration;
     use russh::client;
     use std::sync::Arc;
@@ -5399,7 +5723,7 @@ async fn initiate_connection(
     // the previous attempt. Without this the reconnected session appears
     // fine but the mirror keeps writing upload-fail logs against the old
     // socket forever, and manual Stop is the only way to clear it.
-    mirror::stop_all_for_session(&mirrors, &session_id).await;
+    mirror::stop_all_for_session(mirrors, &session_id).await;
 
     // Separate-sessions: a PRIMARY (re)connect must reap any stale dedicated
     // `::sftp` / `::fwd` connections from a previous attempt, so the frontend can
@@ -5408,8 +5732,8 @@ async fn initiate_connection(
     // entirely for keys that already carry a `::` suffix (i.e. this IS a
     // secondary), and a plain no-op on first connect / shared mode.
     if !is_secondary {
-        teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
-        teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
+        teardown_connection_key(state, mirrors, &format!("{}::sftp", session_id)).await;
+        teardown_connection_key(state, mirrors, &format!("{}::fwd", session_id)).await;
     } else {
         // Dedicated-transport reconnect (manual button / auto-retry) OVER a
         // still-live old handle: the base-tagged tunnels ride this transport and
@@ -5586,7 +5910,7 @@ async fn initiate_connection(
     // Own an Arc into MirrorMap so the outer spawn (which requires 'static)
     // doesn't try to borrow the caller's `mirrors: State<'_, MirrorMap>`.
     // The Arc is 'static; the State reference is not.
-    let mirrors_owned: MirrorMap = mirrors.inner().clone();
+    let mirrors_owned: MirrorMap = Arc::clone(mirrors);
 
     tauri::async_runtime::spawn(async move {
         println!("[BACKEND WORKER] Started connection worker thread for session: {}", session_id_clone);
@@ -6379,17 +6703,47 @@ async fn initiate_connection(
 
         cleanup().await;
     });
-    
+
     Ok(())
+}
+
+/// Tauri command shell: unwraps `State` (deref coercion gives the borrows),
+/// wraps the `AppHandle` in [`Emit`], and funnels into the shared driver.
+/// Behaviour identical to before the split.
+#[tauri::command]
+async fn initiate_connection(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
+    db_state: tauri::State<'_, DbState>,
+    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: String,
+    server_id: i32,
+    custom_password: Option<String>,
+    quick_auth: Option<QuickAuth>,
+    session_role: Option<String>,
+    separate_sessions: Option<bool>,
+) -> Result<(), String> {
+    initiate_connection_inner(
+        Emit::from(&app),
+        &state,
+        &db_state,
+        &mirrors,
+        session_id,
+        server_id,
+        custom_password,
+        quick_auth,
+        session_role,
+        separate_sessions,
+    )
+    .await
 }
 
 /// Frontend acknowledgement of the SSH host-key prompt. The `nonce` must
 /// match the value the matching `fingerprint-prompt-{session_id}` event
 /// carried — without that match the response is dropped on the floor. Any
 /// stale "accept" from a previous attempt cannot satisfy a fresh prompt.
-#[tauri::command]
-async fn verify_fingerprint_response(
-    state: tauri::State<'_, SshState>,
+async fn verify_fingerprint_response_inner(
+    state: &SshState,
     nonce: String,
     accepted: bool,
 ) -> Result<(), String> {
@@ -6399,15 +6753,24 @@ async fn verify_fingerprint_response(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn verify_fingerprint_response(
+    state: tauri::State<'_, SshState>,
+    nonce: String,
+    accepted: bool,
+) -> Result<(), String> {
+    verify_fingerprint_response_inner(&state, nonce, accepted).await
+}
+
 /// Frontend callback for a keyboard-interactive (2FA / verification-code)
 /// prompt. `responses` is `Some(answers)` when the user submits, or `None`
 /// when they cancel. Mirrors `verify_fingerprint_response`: the nonce binds
 /// the answer 1:1 to the connect attempt that emitted the prompt, and a nonce
 /// with no in-flight entry is silently a no-op (stale / forged responses can't
 /// satisfy a fresh prompt).
-#[tauri::command]
-async fn submit_kbi_response(
-    state: tauri::State<'_, SshState>,
+async fn submit_kbi_response_inner(
+    state: &SshState,
     nonce: String,
     responses: Option<Vec<String>>,
 ) -> Result<(), String> {
@@ -6415,6 +6778,16 @@ async fn submit_kbi_response(
         let _ = tx.send(responses);
     }
     Ok(())
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn submit_kbi_response(
+    state: tauri::State<'_, SshState>,
+    nonce: String,
+    responses: Option<Vec<String>>,
+) -> Result<(), String> {
+    submit_kbi_response_inner(&state, nonce, responses).await
 }
 
 // ---- Port forwarding (tunnels) ---------------------------------------------
@@ -6459,7 +6832,7 @@ async fn resolve_tunnel_transport(
 /// Used by the `::fwd` migration (connect success), the fallback/restore
 /// command, and shares its semantics with the primary's auto-start.
 async fn start_tunnel_specs_on(
-    app: &tauri::AppHandle,
+    app: &Emit,
     sid: &str,
     handle: &Arc<tokio::sync::Mutex<russh::client::Handle<ssh_manager::ClientHandler>>>,
     targets: &tunnel::ForwardedTargets,
@@ -6467,7 +6840,6 @@ async fn start_tunnel_specs_on(
     specs_map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<tunnel::TunnelSpec>>>>,
     specs: Vec<tunnel::TunnelSpec>,
 ) {
-    use tauri::Emitter;
     let emit_log = |msg: &str, log_type: &str| {
         let _ = app.emit(
             &format!("session-log-{}", sid),
@@ -6492,7 +6864,7 @@ async fn start_tunnel_specs_on(
             continue;
         }
         match tunnel::start_tunnel(
-            app.clone(),
+            Emit::from(app.clone()),
             sid.to_string(),
             Arc::clone(handle),
             Arc::clone(tunnels),
@@ -6526,18 +6898,17 @@ async fn start_tunnel_specs_on(
     }
 }
 
-#[tauri::command]
-async fn start_tunnel(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
+async fn start_tunnel_inner(
+    app: Emit,
+    state: &SshState,
     session_id: String,
     spec: tunnel::TunnelSpec,
 ) -> Result<String, String> {
     // Dedicated-transport aware: rides the `::fwd` connection when one is up,
     // the primary otherwise. The tunnel is TAGGED under the plain session id
     // either way, so the Tunnels panel / list / teardown never re-key.
-    let (handle, forwarded) = resolve_tunnel_transport(state.inner(), &session_id).await?;
-    let id = tunnel::start_tunnel(app, session_id.clone(), handle, Arc::clone(&state.tunnels), forwarded, spec.clone()).await?;
+    let (handle, forwarded) = resolve_tunnel_transport(state, &session_id).await?;
+    let id = tunnel::start_tunnel(Emit::from(app.clone()), session_id.clone(), handle, Arc::clone(&state.tunnels), forwarded, spec.clone()).await?;
     // Record this ad-hoc spec against the session so a future reconnect can
     // re-open it. Dedup against (kind, local, remote) so toggling the same
     // tunnel off-and-on doesn't accumulate duplicates.
@@ -6551,9 +6922,19 @@ async fn start_tunnel(
     Ok(id)
 }
 
+/// Tauri command shell — unwraps `State`, wraps `AppHandle` in [`Emit`].
 #[tauri::command]
-async fn stop_tunnel(
+async fn start_tunnel(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SshState>,
+    session_id: String,
+    spec: tunnel::TunnelSpec,
+) -> Result<String, String> {
+    start_tunnel_inner(Emit::from(&app), &state, session_id, spec).await
+}
+
+async fn stop_tunnel_inner(
+    state: &SshState,
     tunnel_id: String,
 ) -> Result<(), String> {
     // Snapshot spec + session BEFORE stop — the listener task removes itself
@@ -6581,12 +6962,29 @@ async fn stop_tunnel(
     Ok(())
 }
 
+async fn list_tunnels_inner(
+    state: &SshState,
+    session_id: Option<String>,
+) -> Result<Vec<tunnel::TunnelStatus>, String> {
+    Ok(tunnel::list_tunnels(&state.tunnels, session_id.as_deref()).await)
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn stop_tunnel(
+    state: tauri::State<'_, SshState>,
+    tunnel_id: String,
+) -> Result<(), String> {
+    stop_tunnel_inner(&state, tunnel_id).await
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
 async fn list_tunnels(
     state: tauri::State<'_, SshState>,
     session_id: Option<String>,
 ) -> Result<Vec<tunnel::TunnelStatus>, String> {
-    Ok(tunnel::list_tunnels(&state.tunnels, session_id.as_deref()).await)
+    list_tunnels_inner(&state, session_id).await
 }
 
 /// Persist the session's current live tunnel set to the node's saved `tunnels`
@@ -6594,10 +6992,9 @@ async fn list_tunnels(
 /// survive to the next time the node is opened. The Tunnels panel calls this
 /// after a successful start/stop. A quick-connect session (server_id <= 0) has
 /// no node to save to, so it's a no-op.
-#[tauri::command]
-async fn persist_session_tunnels(
-    state: tauri::State<'_, SshState>,
-    db_state: tauri::State<'_, DbState>,
+async fn persist_session_tunnels_inner(
+    state: &SshState,
+    db_state: &DbState,
     session_id: String,
     server_id: i32,
 ) -> Result<(), String> {
@@ -6622,8 +7019,19 @@ async fn persist_session_tunnels(
         )
         .map_err(|e| format!("[DATABASE] TUNNELS_SAVE_FAILED: SQL_ERROR={}", e))?;
     }
-    save_vault_internal(&db_state)?;
+    save_vault_internal(db_state)?;
     Ok(())
+}
+
+/// Tauri command shell — unwraps `State`s and funnels into the shared impl.
+#[tauri::command]
+async fn persist_session_tunnels(
+    state: tauri::State<'_, SshState>,
+    db_state: tauri::State<'_, DbState>,
+    session_id: String,
+    server_id: i32,
+) -> Result<(), String> {
+    persist_session_tunnels_inner(&state, &db_state, session_id, server_id).await
 }
 
 /// (Re)start every tunnel the session should have — the in-memory replay list
@@ -6632,11 +7040,10 @@ async fn persist_session_tunnels(
 /// otherwise). Idempotent: specs already running under the session's tag are
 /// skipped. The frontend calls this to restore forwarding after the dedicated
 /// connection fails or is toggled off, so tunnels always land somewhere.
-#[tauri::command]
-async fn restart_session_tunnels(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
-    db_state: tauri::State<'_, DbState>,
+async fn restart_session_tunnels_inner(
+    app: Emit,
+    state: &SshState,
+    db_state: &DbState,
     session_id: String,
     server_id: i32,
 ) -> Result<(), String> {
@@ -6677,7 +7084,7 @@ async fn restart_session_tunnels(
         return Ok(());
     }
 
-    let (handle, targets) = resolve_tunnel_transport(state.inner(), &session_id).await?;
+    let (handle, targets) = resolve_tunnel_transport(state, &session_id).await?;
     start_tunnel_specs_on(
         &app,
         &session_id,
@@ -6691,11 +7098,22 @@ async fn restart_session_tunnels(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State`s, wraps `AppHandle` in [`Emit`].
+#[tauri::command]
+async fn restart_session_tunnels(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
+    db_state: tauri::State<'_, DbState>,
+    session_id: String,
+    server_id: i32,
+) -> Result<(), String> {
+    restart_session_tunnels_inner(Emit::from(&app), &state, &db_state, session_id, server_id).await
+}
+
 // ----- Mirror commands -----------------------------------------------------
 
-#[tauri::command]
-async fn mirror_dry_run(
-    ssh: tauri::State<'_, SshState>,
+async fn mirror_dry_run_inner(
+    ssh: &SshState,
     session_id: String,
     spec: mirror::MirrorSpec,
 ) -> Result<mirror::DryRunReport, String> {
@@ -6706,12 +7124,20 @@ async fn mirror_dry_run(
     };
     mirror::dry_run(handle, spec).await
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `mirror_dry_run_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn start_mirror(
-    app: tauri::AppHandle,
+async fn mirror_dry_run(
     ssh: tauri::State<'_, SshState>,
-    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: String,
+    spec: mirror::MirrorSpec,
+) -> Result<mirror::DryRunReport, String> {
+    mirror_dry_run_inner(&ssh, session_id, spec).await
+}
+
+async fn start_mirror_inner(
+    app: Emit,
+    ssh: &SshState,
+    mirrors: &MirrorMap,
     session_id: String,
     spec: mirror::MirrorSpec,
 ) -> Result<String, String> {
@@ -6722,21 +7148,46 @@ async fn start_mirror(
     };
     mirror::start(app, session_id, handle, Arc::clone(&mirrors), spec).await
 }
+/// Tauri command shell — unwraps managed state and delegates to `start_mirror_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn start_mirror(
+    app: tauri::AppHandle,
+    ssh: tauri::State<'_, SshState>,
+    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: String,
+    spec: mirror::MirrorSpec,
+) -> Result<String, String> {
+    start_mirror_inner(Emit::from(&app), &ssh, &mirrors, session_id, spec).await
+}
 
+async fn stop_mirror_inner(
+    mirrors: &MirrorMap,
+    mirror_id: String,
+) -> Result<(), String> {
+    mirror::stop(&mirrors, &mirror_id).await
+}
+/// Tauri command shell — unwraps managed state and delegates to `stop_mirror_inner` (shared with `serve` mode).
 #[tauri::command]
 async fn stop_mirror(
     mirrors: tauri::State<'_, MirrorMap>,
     mirror_id: String,
 ) -> Result<(), String> {
-    mirror::stop(&mirrors, &mirror_id).await
+    stop_mirror_inner(&mirrors, mirror_id).await
 }
 
+async fn list_mirrors_inner(
+    mirrors: &MirrorMap,
+    session_id: Option<String>,
+) -> Result<Vec<mirror::MirrorStatus>, String> {
+    Ok(mirror::list(&mirrors, session_id.as_deref()).await)
+}
+/// Tauri command shell — unwraps managed state and delegates to `list_mirrors_inner` (shared with `serve` mode).
 #[tauri::command]
 async fn list_mirrors(
     mirrors: tauri::State<'_, MirrorMap>,
     session_id: Option<String>,
 ) -> Result<Vec<mirror::MirrorStatus>, String> {
-    Ok(mirror::list(&mirrors, session_id.as_deref()).await)
+    list_mirrors_inner(&mirrors, session_id).await
 }
 
 /// Native OS folder picker. Used by MirrorsPanel to fill in `local`.
@@ -6754,10 +7205,13 @@ async fn pick_local_directory() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn disconnect_session(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
-    mirrors: tauri::State<'_, MirrorMap>,
+/// Inner session teardown shared by the desktop Tauri command and `serve`
+/// mode. Same split pattern as the read commands — `State` becomes borrows,
+/// `AppHandle` becomes [`Emit`]; the body is otherwise untouched.
+async fn disconnect_session_inner(
+    app: Emit,
+    state: &SshState,
+    mirrors: &MirrorMap,
     session_id: String,
 ) -> Result<(), String> {
     // Invalidate any connect worker still handshaking for THIS key: bump the
@@ -6805,7 +7259,7 @@ async fn disconnect_session(
     state.session_tunnel_specs.lock().await.remove(&session_id);
     // Same idea for any mirror that's still running — its watcher would
     // try to push uploads through a dead SSH handle otherwise.
-    mirror::stop_all_for_session(&mirrors, &session_id).await;
+    mirror::stop_all_for_session(mirrors, &session_id).await;
     // Drop SFTP first so the channel it holds is freed before we tear down the
     // underlying SSH handle.
     state.sftp_sessions.lock().await.remove(&session_id);
@@ -6836,13 +7290,12 @@ async fn disconnect_session(
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
     // must not recurse into non-existent grandchildren.
     if !session_id.contains("::") {
-        teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
-        teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
+        teardown_connection_key(state, mirrors, &format!("{}::sftp", session_id)).await;
+        teardown_connection_key(state, mirrors, &format!("{}::fwd", session_id)).await;
     }
     // Tell the UI so the tab status dot flips to red. `user_initiated` keeps
     // SessionView from kicking off an auto-reconnect cycle for an intentional
     // disconnect — distinct from the watcher path which has no such flag.
-    use tauri::Emitter;
     let _ = app.emit(
         &format!("session-disconnected-{}", session_id),
         serde_json::json!({
@@ -6853,10 +7306,20 @@ async fn disconnect_session(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State`, wraps the `AppHandle` in [`Emit`],
+/// and funnels into the shared teardown. Behaviour identical to before.
 #[tauri::command]
-async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32) -> Result<(), String> {
+async fn disconnect_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
+    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: String,
+) -> Result<(), String> {
+    disconnect_session_inner(Emit::from(&app), &state, &mirrors, session_id).await
+}
+
+async fn open_terminal_inner(app: Emit, state: &SshState, session_id: String, terminal_id: String, cols: u32, rows: u32) -> Result<(), String> {
     use russh::ChannelMsg;
-    use tauri::Emitter;
     use std::sync::Arc;
     use crate::ssh_manager::TerminalCommand;
 
@@ -6981,8 +7444,14 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State`, wraps the `AppHandle` in [`Emit`],
+/// and funnels into the shared driver. Behaviour identical to before.
 #[tauri::command]
-async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: String, data: Vec<u8>) -> Result<(), String> {
+async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32) -> Result<(), String> {
+    open_terminal_inner(Emit::from(&app), &state, session_id, terminal_id, cols, rows).await
+}
+
+async fn write_terminal_data_inner(state: &SshState, terminal_id: String, data: Vec<u8>) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
     // Clone the Sender OUT of the map, then release the map lock before we
     // await on send(). If we held the guard across the send, a saturated
@@ -6997,8 +7466,13 @@ async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: Str
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String, cols: u32, rows: u32) -> Result<(), String> {
+async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: String, data: Vec<u8>) -> Result<(), String> {
+    write_terminal_data_inner(&state, terminal_id, data).await
+}
+
+async fn resize_terminal_inner(state: &SshState, terminal_id: String, cols: u32, rows: u32) -> Result<(), String> {
     if let Some(tx) = state.resize_txs.lock().await.get(&terminal_id) {
         // send_replace overwrites the current value unconditionally —
         // perfect for a coalescing last-wins channel.
@@ -7007,11 +7481,22 @@ async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String,
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
+async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String, cols: u32, rows: u32) -> Result<(), String> {
+    resize_terminal_inner(&state, terminal_id, cols, rows).await
+}
+
+async fn close_terminal_inner(state: &SshState, terminal_id: String) -> Result<(), String> {
     state.terminal_txs.lock().await.remove(&terminal_id);
     state.resize_txs.lock().await.remove(&terminal_id);
     Ok(())
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
+    close_terminal_inner(&state, terminal_id).await
 }
 
 // Read-only Info-panel probes. Each tab fetches its own section on first
@@ -7365,9 +7850,8 @@ async fn run_info_script(
     })
 }
 
-#[tauri::command]
-async fn ssh_info_probe_section(
-    state: tauri::State<'_, SshState>,
+async fn ssh_info_probe_section_inner(
+    state: &SshState,
     session_id: String,
     section: String,
 ) -> Result<InfoSectionResult, String> {
@@ -7381,6 +7865,15 @@ async fn ssh_info_probe_section(
         other => return Err(format!("unknown info section: {}", other)),
     };
     run_info_script(&state, &session_id, script, timeout).await
+}
+/// Tauri command shell — unwraps managed state and delegates to `ssh_info_probe_section_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn ssh_info_probe_section(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    section: String,
+) -> Result<InfoSectionResult, String> {
+    ssh_info_probe_section_inner(&state, session_id, section).await
 }
 
 // Validate an iptables/nft table/chain identifier — strict allow-list.
@@ -7397,9 +7890,8 @@ fn is_safe_fw_ident(s: &str) -> bool {
 // a per-chain summary only; this command pulls the raw rules for one chain
 // on user expand. Wire cost stays proportional to what the user actually
 // looks at, not the size of the whole ruleset.
-#[tauri::command]
-async fn ssh_iptables_chain(
-    state: tauri::State<'_, SshState>,
+async fn ssh_iptables_chain_inner(
+    state: &SshState,
     session_id: String,
     table: String,
     chain: String,
@@ -7426,10 +7918,19 @@ printf '%s' \"$OUT\"",
     );
     run_exec_capture(&state, &session_id, &cmd, 15).await
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_iptables_chain_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn ssh_nft_chain(
+async fn ssh_iptables_chain(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+    table: String,
+    chain: String,
+) -> Result<String, String> {
+    ssh_iptables_chain_inner(&state, session_id, table, chain).await
+}
+
+async fn ssh_nft_chain_inner(
+    state: &SshState,
     session_id: String,
     family: String,
     table: String,
@@ -7448,6 +7949,17 @@ printf '%s' \"$OUT\"",
         f = family, t = table, c = chain
     );
     run_exec_capture(&state, &session_id, &cmd, 15).await
+}
+/// Tauri command shell — unwraps managed state and delegates to `ssh_nft_chain_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn ssh_nft_chain(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    family: String,
+    table: String,
+    chain: String,
+) -> Result<String, String> {
+    ssh_nft_chain_inner(&state, session_id, family, table, chain).await
 }
 
 #[derive(serde::Serialize)]
@@ -7509,9 +8021,8 @@ fn parse_exit_marker(raw: &str) -> (i32, String) {
     }
 }
 
-#[tauri::command]
-async fn ssh_systemctl_action(
-    state: tauri::State<'_, SshState>,
+async fn ssh_systemctl_action_inner(
+    state: &SshState,
     session_id: String,
     unit: String,
     action: String,
@@ -7568,15 +8079,24 @@ async fn ssh_systemctl_action(
         used_sudo: true,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_systemctl_action_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn ssh_systemctl_action(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    unit: String,
+    action: String,
+) -> Result<SystemctlActionResult, String> {
+    ssh_systemctl_action_inner(&state, session_id, unit, action).await
+}
 
 /// Signal a process by PID (Ports / Processes tab "kill" action). Tries the
 /// user's own `kill` first, then `sudo -n kill` on a permission error — same
 /// non-interactive sudo pattern as ssh_systemctl_action. Both the PID (a
 /// validated i32) and the signal (an allow-listed name) are interpolated into
 /// the shell command, so neither is attacker-controlled free text.
-#[tauri::command]
-async fn ssh_kill_process(
-    state: tauri::State<'_, SshState>,
+async fn ssh_kill_process_inner(
+    state: &SshState,
     session_id: String,
     pid: i32,
     signal: Option<String>,
@@ -7619,6 +8139,16 @@ async fn ssh_kill_process(
         stderr: String::new(),
         used_sudo: true,
     })
+}
+/// Tauri command shell — unwraps managed state and delegates to `ssh_kill_process_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn ssh_kill_process(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    pid: i32,
+    signal: Option<String>,
+) -> Result<SystemctlActionResult, String> {
+    ssh_kill_process_inner(&state, session_id, pid, signal).await
 }
 
 #[derive(serde::Serialize)]
@@ -7705,13 +8235,12 @@ pub async fn get_sftp_session(
     Ok(arc)
 }
 
-#[tauri::command]
-async fn sftp_list_dir(
-    state: tauri::State<'_, SshState>,
+async fn sftp_list_dir_inner(
+    state: &SshState,
     session_id: String,
     path: String,
 ) -> Result<SftpListResult, String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     let target_path = if path.is_empty() { ".".to_string() } else { path.clone() };
     let canonical_path = sftp.canonicalize(&target_path).await.map_err(|e| e.to_string())?;
     
@@ -7763,47 +8292,67 @@ async fn sftp_list_dir(
     })
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_create_dir(
-    state: tauri::State<'_, SshState>,
+async fn sftp_list_dir(state: tauri::State<'_, SshState>, session_id: String, path: String) -> Result<SftpListResult, String> {
+    sftp_list_dir_inner(&state, session_id, path).await
+}
+
+async fn sftp_create_dir_inner(
+    state: &SshState,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     sftp.create_dir(path).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_remove_file(
-    state: tauri::State<'_, SshState>,
+async fn sftp_create_dir(state: tauri::State<'_, SshState>, session_id: String, path: String) -> Result<(), String> {
+    sftp_create_dir_inner(&state, session_id, path).await
+}
+
+async fn sftp_remove_file_inner(
+    state: &SshState,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     sftp.remove_file(path).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_remove_dir(
-    state: tauri::State<'_, SshState>,
+async fn sftp_remove_file(state: tauri::State<'_, SshState>, session_id: String, path: String) -> Result<(), String> {
+    sftp_remove_file_inner(&state, session_id, path).await
+}
+
+async fn sftp_remove_dir_inner(
+    state: &SshState,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     sftp.remove_dir(path).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_rename(
-    state: tauri::State<'_, SshState>,
+async fn sftp_remove_dir(state: tauri::State<'_, SshState>, session_id: String, path: String) -> Result<(), String> {
+    sftp_remove_dir_inner(&state, session_id, path).await
+}
+
+async fn sftp_rename_inner(
+    state: &SshState,
     session_id: String,
     oldpath: String,
     newpath: String,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
 
     // First try the rename as-is — the common case is the target's parent
     // already exists.
@@ -7846,14 +8395,19 @@ async fn sftp_rename(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_set_permissions(
-    state: tauri::State<'_, SshState>,
+async fn sftp_rename(state: tauri::State<'_, SshState>, session_id: String, oldpath: String, newpath: String) -> Result<(), String> {
+    sftp_rename_inner(&state, session_id, oldpath, newpath).await
+}
+
+async fn sftp_set_permissions_inner(
+    state: &SshState,
     session_id: String,
     path: String,
     permissions: u32,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     // Propagate metadata fetch errors instead of falling back to a zeroed
     // FileAttributes. Without this, a transient network blip or a perms
     // failure during read would have us send `set_metadata` with uid=gid
@@ -7865,15 +8419,20 @@ async fn sftp_set_permissions(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_set_owner(
-    state: tauri::State<'_, SshState>,
+async fn sftp_set_permissions(state: tauri::State<'_, SshState>, session_id: String, path: String, permissions: u32) -> Result<(), String> {
+    sftp_set_permissions_inner(&state, session_id, path, permissions).await
+}
+
+async fn sftp_set_owner_inner(
+    state: &SshState,
     session_id: String,
     path: String,
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     let mut metadata = sftp.metadata(&path).await
         .map_err(|e| format!("[SFTP] METADATA_READ_FAILED: {}", e))?;
     metadata.uid = uid;
@@ -7882,16 +8441,20 @@ async fn sftp_set_owner(
     Ok(())
 }
 
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
 #[tauri::command]
-async fn sftp_download_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
+async fn sftp_set_owner(state: tauri::State<'_, SshState>, session_id: String, path: String, uid: Option<u32>, gid: Option<u32>) -> Result<(), String> {
+    sftp_set_owner_inner(&state, session_id, path, uid, gid).await
+}
+
+async fn sftp_download_file_inner(
+    app: Emit,
+    state: &SshState,
     session_id: String,
     remote_path: String,
     local_path: String,
     overwrite: Option<bool>,
 ) -> Result<(), String> {
-    use tauri::Emitter;
     use tokio::io::AsyncReadExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7911,7 +8474,7 @@ async fn sftp_download_file(
     // destination file is being created right now.
     let _guarded_local = guard_local_path(&local_path, true)?;
 
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
 
     // Stat first so we can report a progress percentage. If the server doesn't
     // know the size (some edge SFTP servers omit it), we still report bytes
@@ -8006,6 +8569,20 @@ async fn sftp_download_file(
     local_file.flush().await.map_err(|e| format!("flush: {}", e))?;
     emit_progress(transferred, "done", None);
     Ok(())
+}
+
+/// Tauri command shell — unwraps `State`, wraps the `AppHandle` in [`Emit`],
+/// and funnels into the shared transfer. Behaviour identical to before.
+#[tauri::command]
+async fn sftp_download_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+    overwrite: Option<bool>,
+) -> Result<(), String> {
+    sftp_download_file_inner(Emit::from(&app), &state, session_id, remote_path, local_path, overwrite).await
 }
 
 /// Recursive remote directory download. Walks the remote tree under
@@ -8236,24 +8813,22 @@ async fn sftp_download_dir(
     Ok(())
 }
 
-#[tauri::command]
-async fn sftp_upload_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
+async fn sftp_upload_file_inner(
+    app: Emit,
+    state: &SshState,
     session_id: String,
     local_path: String,
     remote_path: String,
     overwrite: Option<bool>,
 ) -> Result<(), String> {
     use russh_sftp::protocol::OpenFlags;
-    use tauri::Emitter;
     use tokio::io::AsyncWriteExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // Overwrite protection: stat the remote target first; refuse if it
     // exists and the caller hasn't explicitly opted in. Same `EXISTS:<path>`
     // sentinel as the download path.
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     if overwrite != Some(true) {
         if sftp.metadata(&remote_path).await.is_ok() {
             return Err(format!("EXISTS:{}", remote_path));
@@ -8354,6 +8929,20 @@ async fn sftp_upload_file(
         .map_err(|e| format!("Failed to close remote file: {}", e))?;
     emit_progress(transferred, "done", None);
     Ok(())
+}
+
+/// Tauri command shell — unwraps `State`, wraps the `AppHandle` in [`Emit`],
+/// and funnels into the shared transfer. Behaviour identical to before.
+#[tauri::command]
+async fn sftp_upload_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+    overwrite: Option<bool>,
+) -> Result<(), String> {
+    sftp_upload_file_inner(Emit::from(&app), &state, session_id, local_path, remote_path, overwrite).await
 }
 
 /// Recursive directory upload — mirror of sftp_download_dir. Walks the local
@@ -8584,15 +9173,20 @@ async fn sftp_upload_dir(
 /// "cancelled" status event as soon as it sees true. Unknown ids are a no-op
 /// — by the time the UI's stop button click reaches us the transfer may have
 /// already finished on its own.
-#[tauri::command]
-async fn sftp_cancel_transfer(
-    state: tauri::State<'_, SshState>,
+async fn sftp_cancel_transfer_inner(
+    state: &SshState,
     transfer_id: String,
 ) -> Result<(), String> {
     if let Some(flag) = state.transfer_cancels.lock().await.get(&transfer_id) {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn sftp_cancel_transfer(state: tauri::State<'_, SshState>, transfer_id: String) -> Result<(), String> {
+    sftp_cancel_transfer_inner(&state, transfer_id).await
 }
 
 /// Bucket the failure modes that can come out of an SSH connect / auth round.
@@ -9009,13 +9603,12 @@ async fn sftp_open_remote_file(
     Ok(())
 }
 
-#[tauri::command]
-async fn sftp_prepare_drag(
-    state: tauri::State<'_, SshState>,
+async fn sftp_prepare_drag_inner(
+    state: &SshState,
     session_id: String,
     remote_path: String,
 ) -> Result<String, String> {
-    let sftp = get_sftp_session(&state, &session_id).await?;
+    let sftp = get_sftp_session(state, &session_id).await?;
     let mut file = sftp.open(&remote_path).await.map_err(|e| e.to_string())?;
     
     // Read remote file data
@@ -9042,6 +9635,12 @@ async fn sftp_prepare_drag(
     std::fs::write(&temp_file_path, &data).map_err(|e| format!("Failed to write temporary file: {}", e))?;
 
     Ok(temp_file_path.to_string_lossy().to_string())
+}
+
+/// Tauri command shell — unwraps `State` and funnels into the shared impl.
+#[tauri::command]
+async fn sftp_prepare_drag(state: tauri::State<'_, SshState>, session_id: String, remote_path: String) -> Result<String, String> {
+    sftp_prepare_drag_inner(&state, session_id, remote_path).await
 }
 
 #[tauri::command]
@@ -9277,8 +9876,7 @@ struct ImportedHost {
 /// Desktop-only. Android has no meaningful `~/.ssh/config` path and its
 /// import story goes through profile export/import instead — we return a
 /// clear message rather than pretending to look somewhere.
-#[tauri::command]
-fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
+fn parse_ssh_config_inner(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
     #[cfg(target_os = "android")]
     {
         let _ = path;
@@ -9414,6 +10012,11 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
         Ok(out)
     }
 }
+/// Tauri command shell — unwraps managed state and delegates to `parse_ssh_config_inner` (shared with `serve` mode).
+#[tauri::command]
+fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
+    parse_ssh_config_inner(path)
+}
 
 /// Parse a blob of text pasted from another SSH client's export and return
 /// the same `ImportedHost` shape as `parse_ssh_config`. Auto-detects the
@@ -9442,8 +10045,7 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
 /// Anything the parser can't recognise is a soft-fail: the returned
 /// `Vec` is what we DID find, the message describes what got skipped.
 /// The command is desktop+Android — no filesystem access, just text.
-#[tauri::command]
-fn parse_client_import(text: String) -> Result<Vec<ImportedHost>, String> {
+fn parse_client_import_inner(text: String) -> Result<Vec<ImportedHost>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err("Paste an exported session block first.".into());
@@ -9517,6 +10119,11 @@ fn parse_client_import(text: String) -> Result<Vec<ImportedHost>, String> {
     }
 
     Err("Unrecognised format — paste a JSON array, a PuTTY .reg export, or a MobaXterm .mxtsessions block.".into())
+}
+/// Tauri command shell — unwraps managed state and delegates to `parse_client_import_inner` (shared with `serve` mode).
+#[tauri::command]
+fn parse_client_import(text: String) -> Result<Vec<ImportedHost>, String> {
+    parse_client_import_inner(text)
 }
 
 /// Parse `regedit /e` output of PuTTY's session key. The format is
@@ -10056,10 +10663,9 @@ fn load_settings_from_db(conn: &rusqlite::Connection) -> monitor::MonitorSetting
     monitor::MonitorSettings::default()
 }
 
-#[tauri::command]
-async fn monitor_get_settings(
-    db_state: tauri::State<'_, DbState>,
-    settings: tauri::State<'_, SharedSettings>,
+async fn monitor_get_settings_inner(
+    db_state: &DbState,
+    settings: &SharedSettings,
 ) -> Result<monitor::MonitorSettings, String> {
     // First-call lazy-load: if the in-memory copy is still at defaults but
     // the DB has saved values, hydrate the in-memory copy so all pollers
@@ -10080,11 +10686,18 @@ async fn monitor_get_settings(
     }
     Ok(settings.lock().await.clone())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_get_settings_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_set_settings(
+async fn monitor_get_settings(
     db_state: tauri::State<'_, DbState>,
     settings: tauri::State<'_, SharedSettings>,
+) -> Result<monitor::MonitorSettings, String> {
+    monitor_get_settings_inner(&db_state, &settings).await
+}
+
+async fn monitor_set_settings_inner(
+    db_state: &DbState,
+    settings: &SharedSettings,
     new_settings: monitor::MonitorSettings,
 ) -> Result<monitor::MonitorSettings, String> {
     let sane = new_settings.sanitized();
@@ -10102,11 +10715,19 @@ async fn monitor_set_settings(
     *settings.lock().await = sane.clone();
     Ok(sane)
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_set_settings_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_list(
+async fn monitor_set_settings(
     db_state: tauri::State<'_, DbState>,
-    map: tauri::State<'_, MonitorMap>,
+    settings: tauri::State<'_, SharedSettings>,
+    new_settings: monitor::MonitorSettings,
+) -> Result<monitor::MonitorSettings, String> {
+    monitor_set_settings_inner(&db_state, &settings, new_settings).await
+}
+
+async fn monitor_list_inner(
+    db_state: &DbState,
+    map: &MonitorMap,
 ) -> Result<Vec<MonitorRow>, String> {
     // Pull DB rows first so we always include configured-but-paused entries
     // even if they have no live MonitorEntry yet.
@@ -10133,7 +10754,7 @@ async fn monitor_list(
     };
 
     // Merge live state from MonitorMap on top.
-    let live = monitor::list(map.inner().clone()).await;
+    let live = monitor::list(Arc::clone(map)).await;
     let live_by_id: std::collections::HashMap<i32, monitor::MonitorInfo> =
         live.into_iter().map(|m| (m.node_id, m)).collect();
 
@@ -10151,10 +10772,17 @@ async fn monitor_list(
         }
     }).collect())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_list_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_add(
+async fn monitor_list(
     db_state: tauri::State<'_, DbState>,
+    map: tauri::State<'_, MonitorMap>,
+) -> Result<Vec<MonitorRow>, String> {
+    monitor_list_inner(&db_state, &map).await
+}
+
+async fn monitor_add_inner(
+    db_state: &DbState,
     node_id: i32,
 ) -> Result<(), String> {
     // Persist the config row only; the poller doesn't spawn until the user
@@ -10170,14 +10798,21 @@ async fn monitor_add(
     save_vault_internal(&db_state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_add_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_remove(
+async fn monitor_add(
     db_state: tauri::State<'_, DbState>,
-    map: tauri::State<'_, MonitorMap>,
     node_id: i32,
 ) -> Result<(), String> {
-    monitor::stop_monitor(map.inner().clone(), node_id).await;
+    monitor_add_inner(&db_state, node_id).await
+}
+
+async fn monitor_remove_inner(
+    db_state: &DbState,
+    map: &MonitorMap,
+    node_id: i32,
+) -> Result<(), String> {
+    monitor::stop_monitor(Arc::clone(map), node_id).await;
     {
         let guard = db_state.conn.lock().map_err(|_| "lock")?;
         let conn = guard.as_ref().ok_or("db not ready")?;
@@ -10187,11 +10822,19 @@ async fn monitor_remove(
     save_vault_internal(&db_state)?;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_remove_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_set_metrics(
+async fn monitor_remove(
     db_state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
+    node_id: i32,
+) -> Result<(), String> {
+    monitor_remove_inner(&db_state, &map, node_id).await
+}
+
+async fn monitor_set_metrics_inner(
+    db_state: &DbState,
+    map: &MonitorMap,
     node_id: i32,
     metrics: Vec<String>,
 ) -> Result<(), String> {
@@ -10205,14 +10848,23 @@ async fn monitor_set_metrics(
     }
     save_vault_internal(&db_state)?;
     // If a live poller exists, hot-update it; otherwise it'll pick up on resume.
-    let _ = monitor::set_enabled_metrics(map.inner().clone(), node_id, metrics).await;
+    let _ = monitor::set_enabled_metrics(Arc::clone(map), node_id, metrics).await;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_set_metrics_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_set_custom_metrics(
+async fn monitor_set_metrics(
     db_state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
+    node_id: i32,
+    metrics: Vec<String>,
+) -> Result<(), String> {
+    monitor_set_metrics_inner(&db_state, &map, node_id, metrics).await
+}
+
+async fn monitor_set_custom_metrics_inner(
+    db_state: &DbState,
+    map: &MonitorMap,
     node_id: i32,
     customs: Vec<monitor::CustomMetric>,
 ) -> Result<(), String> {
@@ -10224,16 +10876,25 @@ async fn monitor_set_custom_metrics(
         upsert_monitor_config(conn, node_id, &metrics, &customs, paused)?;
     }
     save_vault_internal(&db_state)?;
-    let _ = monitor::set_custom_metrics(map.inner().clone(), node_id, customs).await;
+    let _ = monitor::set_custom_metrics(Arc::clone(map), node_id, customs).await;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_set_custom_metrics_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_resume(
-    app: tauri::AppHandle,
+async fn monitor_set_custom_metrics(
     db_state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
-    settings: tauri::State<'_, SharedSettings>,
+    node_id: i32,
+    customs: Vec<monitor::CustomMetric>,
+) -> Result<(), String> {
+    monitor_set_custom_metrics_inner(&db_state, &map, node_id, customs).await
+}
+
+async fn monitor_resume_inner(
+    app: Emit,
+    db_state: &DbState,
+    map: &MonitorMap,
+    settings: &SharedSettings,
     node_id: i32,
 ) -> Result<(), String> {
     let (auth, metrics, customs, name) = {
@@ -10248,12 +10909,12 @@ async fn monitor_resume(
     save_vault_internal(&db_state)?;
 
     // If a poller already exists, just hot-flip paused; otherwise spawn one.
-    if monitor::set_paused(map.inner().clone(), node_id, false).await.is_err() {
+    if monitor::set_paused(Arc::clone(map), node_id, false).await.is_err() {
         let db_arc = std::sync::Arc::clone(&db_state.conn);
-        let settings_arc: SharedSettings = (*settings.inner()).clone();
+        let settings_arc: SharedSettings = Arc::clone(settings);
         monitor::start_monitor(
             app,
-            map.inner().clone(),
+            Arc::clone(map),
             db_arc,
             settings_arc,
             node_id,
@@ -10266,11 +10927,21 @@ async fn monitor_resume(
     }
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_resume_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_pause(
+async fn monitor_resume(
+    app: tauri::AppHandle,
     db_state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
+    settings: tauri::State<'_, SharedSettings>,
+    node_id: i32,
+) -> Result<(), String> {
+    monitor_resume_inner(Emit::from(&app), &db_state, &map, &settings, node_id).await
+}
+
+async fn monitor_pause_inner(
+    db_state: &DbState,
+    map: &MonitorMap,
     node_id: i32,
 ) -> Result<(), String> {
     {
@@ -10281,14 +10952,22 @@ async fn monitor_pause(
         }
     }
     save_vault_internal(&db_state)?;
-    let _ = monitor::set_paused(map.inner().clone(), node_id, true).await;
+    let _ = monitor::set_paused(Arc::clone(map), node_id, true).await;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_pause_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_pause_all(
+async fn monitor_pause(
     db_state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
+    node_id: i32,
+) -> Result<(), String> {
+    monitor_pause_inner(&db_state, &map, node_id).await
+}
+
+async fn monitor_pause_all_inner(
+    db_state: &DbState,
+    map: &MonitorMap,
 ) -> Result<(), String> {
     {
         let guard = db_state.conn.lock().map_err(|_| "lock")?;
@@ -10297,16 +10976,23 @@ async fn monitor_pause_all(
             .map_err(|e| e.to_string())?;
     }
     save_vault_internal(&db_state)?;
-    monitor::pause_all(map.inner().clone()).await;
+    monitor::pause_all(Arc::clone(map)).await;
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `monitor_pause_all_inner` (shared with `serve` mode).
 #[tauri::command]
-async fn monitor_resume_all(
-    app: tauri::AppHandle,
+async fn monitor_pause_all(
     db_state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
-    settings: tauri::State<'_, SharedSettings>,
+) -> Result<(), String> {
+    monitor_pause_all_inner(&db_state, &map).await
+}
+
+async fn monitor_resume_all_inner(
+    app: Emit,
+    db_state: &DbState,
+    map: &MonitorMap,
+    settings: &SharedSettings,
 ) -> Result<(), String> {
     // Persist all to unpaused first.
     let node_ids: Vec<i32> = {
@@ -10322,7 +11008,7 @@ async fn monitor_resume_all(
 
     // Start (or hot-resume) each one.
     for node_id in node_ids {
-        if monitor::set_paused(map.inner().clone(), node_id, false).await.is_err() {
+        if monitor::set_paused(Arc::clone(map), node_id, false).await.is_err() {
             let (auth, metrics, customs, name) = {
                 let guard = db_state.conn.lock().map_err(|_| "lock")?;
                 let conn = guard.as_ref().ok_or("db not ready")?;
@@ -10332,10 +11018,10 @@ async fn monitor_resume_all(
                 (resolve_node_auth_for_monitor(conn, node_id)?, metrics, customs, name)
             };
             let db_arc = std::sync::Arc::clone(&db_state.conn);
-            let settings_arc: SharedSettings = (*settings.inner()).clone();
+            let settings_arc: SharedSettings = Arc::clone(settings);
             monitor::start_monitor(
                 app.clone(),
-                map.inner().clone(),
+                Arc::clone(map),
                 db_arc,
                 settings_arc,
                 node_id,
@@ -10348,6 +11034,16 @@ async fn monitor_resume_all(
         }
     }
     Ok(())
+}
+/// Tauri command shell — unwraps managed state and delegates to `monitor_resume_all_inner` (shared with `serve` mode).
+#[tauri::command]
+async fn monitor_resume_all(
+    app: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    map: tauri::State<'_, MonitorMap>,
+    settings: tauri::State<'_, SharedSettings>,
+) -> Result<(), String> {
+    monitor_resume_all_inner(Emit::from(&app), &db_state, &map, &settings).await
 }
 
 /// Library entrypoint shared by both the desktop `bin/main.rs` shim and
@@ -10446,7 +11142,7 @@ pub fn run() {
     // installer AND the Android APK. Capability is granted in default.json.
     let builder = builder.plugin(tauri_plugin_opener::init());
     builder
-        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None) })
+        .manage(new_db_state())
         .manage(SshState::new())
         // Docker live-log stream registry — keyed by frontend-issued stream id,
         // values are tokio AbortHandles so the user can stop tailing on demand.
@@ -10573,4 +11269,4 @@ mod tests {
             assert!(is_safe_dir_entry_name(ok), "should accept {:?}", ok);
         }
     }
-}
+}

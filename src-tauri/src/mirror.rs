@@ -45,7 +45,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter};
+use crate::Emit;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinSet;
@@ -140,6 +140,12 @@ pub struct ActiveMirror {
 
 pub type MirrorMap = Arc<Mutex<HashMap<String, ActiveMirror>>>;
 
+/// Fresh map for a process that owns no mirrors yet. Mirrors the
+/// `new_db_state` pattern: `run()` and `serve` build from the same helper.
+pub(crate) fn new_mirror_map() -> MirrorMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 // ---------------------------------------------------------------------------
 // IDs + helpers
 // ---------------------------------------------------------------------------
@@ -199,7 +205,7 @@ fn local_to_remote(local: &Path, local_root: &Path, remote_root: &str) -> Option
 // Status + log emission
 // ---------------------------------------------------------------------------
 
-async fn emit_update(app: &AppHandle, status: &MirrorStatus) {
+async fn emit_update(app: &Emit, status: &MirrorStatus) {
     let _ = app.emit(&format!("mirror-update-{}", status.session_id), status.clone());
 }
 
@@ -214,7 +220,7 @@ struct MirrorLogEntry<'a> {
 }
 
 fn emit_log(
-    app: &AppHandle,
+    app: &Emit,
     session_id: &str,
     mirror_id: &str,
     level: &str,
@@ -226,7 +232,7 @@ fn emit_log(
     let _ = app.emit(&format!("mirror-log-{}", session_id), entry);
 }
 
-async fn set_state(app: &AppHandle, status: &Arc<Mutex<MirrorStatus>>, new: &str, err: Option<String>) {
+async fn set_state(app: &Emit, status: &Arc<Mutex<MirrorStatus>>, new: &str, err: Option<String>) {
     let snapshot = {
         let mut s = status.lock().await;
         s.state = new.into();
@@ -670,7 +676,7 @@ async fn walk_remote(
 // ---------------------------------------------------------------------------
 
 pub async fn start(
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     map: MirrorMap,
@@ -780,7 +786,7 @@ pub async fn stop_all_for_session(map: &MirrorMap, session_id: &str) {
 // ---------------------------------------------------------------------------
 
 async fn run_mirror(
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     mirror_id: String,
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
@@ -1012,7 +1018,7 @@ async fn run_mirror(
 /// bursts, we only care about the *current* state of the path: still
 /// present → upload (overwrites), gone → delete on remote.
 async fn process_event(
-    app: &AppHandle,
+    app: &Emit,
     session_id: &str,
     mirror_id: &str,
     local_root: &Path,

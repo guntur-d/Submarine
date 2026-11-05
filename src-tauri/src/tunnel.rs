@@ -22,12 +22,12 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot, Mutex, Semaphore};
 
 use crate::ssh_manager::ClientHandler;
+use crate::Emit;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -97,8 +97,8 @@ pub struct ForwardEntry {
     /// Tunnel status (shared with the listing UI) — handler increments
     /// `conns_total` and emits an update on every accepted forwarded connection.
     pub status: Arc<Mutex<TunnelStatus>>,
-    /// AppHandle for emitting status updates from inside the handler.
-    pub app: tauri::AppHandle,
+    /// Emit sink for status updates from inside the handler.
+    pub app: Emit,
 }
 
 /// Per-session map of `server_port → ForwardEntry`. Created once per SSH
@@ -153,7 +153,7 @@ fn next_tunnel_id() -> String {
 // Status update helpers
 // ---------------------------------------------------------------------------
 
-async fn emit_update(app: &AppHandle, status: &TunnelStatus) {
+async fn emit_update(app: &Emit, status: &TunnelStatus) {
     let _ = app.emit(
         &format!("tunnel-update-{}", status.session_id),
         status.clone(),
@@ -191,7 +191,7 @@ fn now_ms() -> u128 {
 }
 
 fn emit_log(
-    app: &AppHandle,
+    app: &Emit,
     session_id: &str,
     tunnel_id: &str,
     level: &str,
@@ -223,14 +223,14 @@ fn emit_log(
 struct ActiveGuard {
     counter: Arc<AtomicU32>,
     status: Arc<Mutex<TunnelStatus>>,
-    app: AppHandle,
+    app: Emit,
 }
 
 impl ActiveGuard {
     async fn enter(
         counter: Arc<AtomicU32>,
         status: Arc<Mutex<TunnelStatus>>,
-        app: AppHandle,
+        app: Emit,
     ) -> Self {
         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
         {
@@ -259,7 +259,7 @@ impl Drop for ActiveGuard {
 }
 
 async fn set_state(
-    app: &AppHandle,
+    app: &Emit,
     status_arc: &Arc<Mutex<TunnelStatus>>,
     state: &str,
     error: Option<String>,
@@ -302,7 +302,7 @@ async fn bind_with_retry(addr: &str) -> std::io::Result<TcpListener> {
 }
 
 pub async fn start_tunnel(
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     tunnels_map: TunnelMap,
@@ -668,7 +668,7 @@ where
 }
 
 async fn run_local_forward(
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     listener: TcpListener,
@@ -789,7 +789,7 @@ async fn bridge_local_to_channel(
 // ---------------------------------------------------------------------------
 
 async fn run_dynamic_forward(
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     listener: TcpListener,
@@ -879,7 +879,7 @@ async fn run_dynamic_forward(
 // `ClientHandler::server_channel_open_forwarded_tcpip`, which looks up the
 // port in `ForwardedTargets` and bridges to the local target.
 async fn run_remote_forward(
-    app: AppHandle,
+    app: Emit,
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     bind_addr: String,
     server_port: u32,
@@ -1107,7 +1107,7 @@ async fn handle_dynamic_client(
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     tunnel_id: String,
 ) -> Result<(), String> {
@@ -1150,7 +1150,7 @@ async fn handle_http_proxy(
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
     first_byte: u8,
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     tunnel_id: String,
 ) -> Result<(), String> {
@@ -1451,7 +1451,7 @@ async fn handle_socks4(
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     tunnel_id: String,
 ) -> Result<(), String> {
@@ -1545,7 +1545,7 @@ async fn handle_socks5(
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
-    app: AppHandle,
+    app: Emit,
     session_id: String,
     tunnel_id: String,
 ) -> Result<(), String> {

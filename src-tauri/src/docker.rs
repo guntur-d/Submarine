@@ -8,11 +8,12 @@
 // terminal — both handled inline below.
 
 use crate::ssh_manager::SshState;
+use crate::Emit;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::Emitter;
+
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::AbortHandle;
@@ -163,9 +164,8 @@ pub struct DockerTextResult {
 
 // ---- container actions -----------------------------------------------------
 
-#[tauri::command]
-pub async fn ssh_docker_container_action(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_container_action_inner(
+    state: &SshState,
     session_id: String,
     container: String,
     action: String,
@@ -189,12 +189,21 @@ pub async fn ssh_docker_container_action(
         used_sudo,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_container_action_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_container_action(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    container: String,
+    action: String,
+) -> Result<DockerActionResult, String> {
+    ssh_docker_container_action_inner(&state, session_id, container, action).await
+}
 
 // ---- inspect / stats / logs (one-shot) -------------------------------------
 
-#[tauri::command]
-pub async fn ssh_docker_inspect(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_inspect_inner(
+    state: &SshState,
     session_id: String,
     kind: String,
     name: String,
@@ -217,10 +226,19 @@ pub async fn ssh_docker_inspect(
         used_sudo,
     })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_inspect_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_stats(
+pub async fn ssh_docker_inspect(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+    kind: String,
+    name: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_inspect_inner(&state, session_id, kind, name).await
+}
+
+pub async fn ssh_docker_stats_inner(
+    state: &SshState,
     session_id: String,
     // Optional container filter. When Some, we ask docker for just that
     // one container's stats — an ~80 ms probe on a quiet daemon and a
@@ -248,10 +266,28 @@ pub async fn ssh_docker_stats(
         used_sudo,
     })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_stats_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_logs(
+pub async fn ssh_docker_stats(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+    // Optional container filter. When Some, we ask docker for just that
+    // one container's stats — an ~80 ms probe on a quiet daemon and a
+    // few hundred bytes on the wire. When None, keep the full-list
+    // behaviour so callers that render a resource panel across all
+    // containers still work unchanged.
+    container: Option<String>,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_stats_inner(&state, session_id, // Optional container filter. When Some, we ask docker for just that
+    // one container's stats — an ~80 ms probe on a quiet daemon and a
+    // few hundred bytes on the wire. When None, keep the full-list
+    // behaviour so callers that render a resource panel across all
+    // containers still work unchanged.
+    container).await
+}
+
+pub async fn ssh_docker_logs_inner(
+    state: &SshState,
     session_id: String,
     container: String,
     tail: u32,
@@ -272,12 +308,21 @@ pub async fn ssh_docker_logs(
         used_sudo,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_logs_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_logs(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    container: String,
+    tail: u32,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_logs_inner(&state, session_id, container, tail).await
+}
 
 // ---- networks --------------------------------------------------------------
 
-#[tauri::command]
-pub async fn ssh_docker_networks(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_networks_inner(
+    state: &SshState,
     session_id: String,
 ) -> Result<DockerTextResult, String> {
     let cmd = "docker network ls --format '{{.ID}}|{{.Name}}|{{.Driver}}|{{.Scope}}'";
@@ -288,6 +333,14 @@ pub async fn ssh_docker_networks(
         used_sudo,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_networks_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_networks(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_networks_inner(&state, session_id).await
+}
 
 // ---- lightweight per-resource list commands --------------------------------
 // Separate from the umbrella `ssh_info_probe_section "docker"` so the Docker
@@ -296,9 +349,8 @@ pub async fn ssh_docker_networks(
 // user only wanted the container list. Each one runs a single docker call so
 // the round-trip stays in the ~100–300 ms range on a quiet daemon.
 
-#[tauri::command]
-pub async fn ssh_docker_containers(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_containers_inner(
+    state: &SshState,
     session_id: String,
 ) -> Result<DockerTextResult, String> {
     // Lean field list (only what the UI renders) instead of `{{json .}}` — skips
@@ -307,25 +359,47 @@ pub async fn ssh_docker_containers(
     let (success, data, used_sudo) = run_docker_smart(&state, &session_id, cmd, 15).await?;
     Ok(DockerTextResult { success, data, used_sudo })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_containers_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_images_list(
+pub async fn ssh_docker_containers(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_containers_inner(&state, session_id).await
+}
+
+pub async fn ssh_docker_images_list_inner(
+    state: &SshState,
     session_id: String,
 ) -> Result<DockerTextResult, String> {
     let cmd = "docker images --format '{{.Repository}}|{{.Tag}}|{{.ID}}|{{.Size}}|{{.CreatedSince}}'";
     let (success, data, used_sudo) = run_docker_smart(&state, &session_id, cmd, 15).await?;
     Ok(DockerTextResult { success, data, used_sudo })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_images_list_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_volumes_list(
+pub async fn ssh_docker_images_list(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_images_list_inner(&state, session_id).await
+}
+
+pub async fn ssh_docker_volumes_list_inner(
+    state: &SshState,
     session_id: String,
 ) -> Result<DockerTextResult, String> {
     let cmd = "docker volume ls --format '{{.Name}}|{{.Driver}}|{{.Mountpoint}}'";
     let (success, data, used_sudo) = run_docker_smart(&state, &session_id, cmd, 15).await?;
     Ok(DockerTextResult { success, data, used_sudo })
+}
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_volumes_list_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_volumes_list(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_volumes_list_inner(&state, session_id).await
 }
 
 // ---- compose ---------------------------------------------------------------
@@ -336,9 +410,8 @@ fn compose_prefix() -> &'static str {
     "( docker compose version >/dev/null 2>&1 && CCMD='docker compose' ) || CCMD='docker-compose'; $CCMD"
 }
 
-#[tauri::command]
-pub async fn ssh_docker_compose_list(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_compose_list_inner(
+    state: &SshState,
     session_id: String,
 ) -> Result<DockerTextResult, String> {
     // Plain tabular output (NAME / STATUS / CONFIG FILES) — `--format json`
@@ -354,6 +427,14 @@ pub async fn ssh_docker_compose_list(
         used_sudo,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_compose_list_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_compose_list(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_compose_list_inner(&state, session_id).await
+}
 
 // Per-container compose info. Reads docker's own labels — every container
 // started by compose carries `com.docker.compose.project`, `…service`, and
@@ -361,9 +442,8 @@ pub async fn ssh_docker_compose_list(
 //   <name>|<project>|<config_files>|<service>|<state>
 // Containers without compose labels still appear (project + service empty)
 // so the frontend can filter them out without a second round-trip.
-#[tauri::command]
-pub async fn ssh_docker_compose_per_container(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_compose_per_container_inner(
+    state: &SshState,
     session_id: String,
 ) -> Result<DockerTextResult, String> {
     // Note the unusual quoting: the docker format string itself contains
@@ -378,10 +458,17 @@ pub async fn ssh_docker_compose_per_container(
         used_sudo,
     })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_compose_per_container_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_compose_services(
+pub async fn ssh_docker_compose_per_container(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_compose_per_container_inner(&state, session_id).await
+}
+
+pub async fn ssh_docker_compose_services_inner(
+    state: &SshState,
     session_id: String,
     compose_file: String,
 ) -> Result<DockerTextResult, String> {
@@ -400,10 +487,18 @@ pub async fn ssh_docker_compose_services(
         used_sudo,
     })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_compose_services_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_compose_action(
+pub async fn ssh_docker_compose_services(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+    compose_file: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_compose_services_inner(&state, session_id, compose_file).await
+}
+
+pub async fn ssh_docker_compose_action_inner(
+    state: &SshState,
     session_id: String,
     compose_file: String,
     action: String,
@@ -445,10 +540,20 @@ pub async fn ssh_docker_compose_action(
         used_sudo,
     })
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_compose_action_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_compose_view(
+pub async fn ssh_docker_compose_action(
     state: tauri::State<'_, SshState>,
+    session_id: String,
+    compose_file: String,
+    action: String,
+    service: Option<String>,
+) -> Result<DockerActionResult, String> {
+    ssh_docker_compose_action_inner(&state, session_id, compose_file, action, service).await
+}
+
+pub async fn ssh_docker_compose_view_inner(
+    state: &SshState,
     session_id: String,
     compose_file: String,
 ) -> Result<DockerTextResult, String> {
@@ -465,6 +570,15 @@ pub async fn ssh_docker_compose_view(
         used_sudo: false,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_compose_view_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_compose_view(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    compose_file: String,
+) -> Result<DockerTextResult, String> {
+    ssh_docker_compose_view_inner(&state, session_id, compose_file).await
+}
 
 // ---- prune (safe defaults only) --------------------------------------------
 
@@ -473,9 +587,8 @@ pub async fn ssh_docker_compose_view(
 // networks, and the build cache. Named volumes, tagged images, and
 // running containers are never touched. Anything more aggressive would
 // risk silent data loss and is excluded by product directive.
-#[tauri::command]
-pub async fn ssh_docker_prune(
-    state: tauri::State<'_, SshState>,
+pub async fn ssh_docker_prune_inner(
+    state: &SshState,
     session_id: String,
     scope: String,
 ) -> Result<DockerActionResult, String> {
@@ -494,14 +607,22 @@ pub async fn ssh_docker_prune(
         used_sudo,
     })
 }
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_prune_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_prune(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    scope: String,
+) -> Result<DockerActionResult, String> {
+    ssh_docker_prune_inner(&state, session_id, scope).await
+}
 
 // ---- live logs streaming ---------------------------------------------------
 
-#[tauri::command]
-pub async fn ssh_docker_logs_start(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
-    streams: tauri::State<'_, DockerStreams>,
+pub async fn ssh_docker_logs_start_inner(
+    app: Emit,
+    state: &SshState,
+    streams: &DockerStreams,
     session_id: String,
     stream_id: String,
     container: String,
@@ -636,16 +757,36 @@ pub async fn ssh_docker_logs_start(
         .insert(stream_id, handle.abort_handle());
     Ok(())
 }
-
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_logs_start_inner` (shared with `serve` mode).
 #[tauri::command]
-pub async fn ssh_docker_logs_stop(
+pub async fn ssh_docker_logs_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
     streams: tauri::State<'_, DockerStreams>,
+    session_id: String,
+    stream_id: String,
+    container: String,
+    tail: u32,
+) -> Result<(), String> {
+    ssh_docker_logs_start_inner(Emit::from(&app), &state, &streams, session_id, stream_id, container, tail).await
+}
+
+pub async fn ssh_docker_logs_stop_inner(
+    streams: &DockerStreams,
     stream_id: String,
 ) -> Result<(), String> {
     if let Some(h) = streams.streams.lock().await.remove(&stream_id) {
         h.abort();
     }
     Ok(())
+}
+/// Tauri command shell — unwraps managed state and delegates to `ssh_docker_logs_stop_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn ssh_docker_logs_stop(
+    streams: tauri::State<'_, DockerStreams>,
+    stream_id: String,
+) -> Result<(), String> {
+    ssh_docker_logs_stop_inner(&streams, stream_id).await
 }
 
 // ---- terminal exec into container ------------------------------------------
@@ -655,10 +796,9 @@ pub async fn ssh_docker_logs_stop(
 // pipeline (`terminal-output-<id>` events + write/resize/close commands)
 // the regular shell terminal uses, so xterm.js on the frontend works
 // without any branch — just a different exec target.
-#[tauri::command]
-pub async fn open_container_terminal(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SshState>,
+pub async fn open_container_terminal_inner(
+    app: Emit,
+    state: &SshState,
     session_id: String,
     terminal_id: String,
     container: String,
@@ -794,4 +934,18 @@ pub async fn open_container_terminal(
     });
 
     Ok(())
+}
+/// Tauri command shell — unwraps managed state and delegates to `open_container_terminal_inner` (shared with `serve` mode).
+#[tauri::command]
+pub async fn open_container_terminal(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    terminal_id: String,
+    container: String,
+    cols: u32,
+    rows: u32,
+    use_sudo: bool,
+) -> Result<(), String> {
+    open_container_terminal_inner(Emit::from(&app), &state, session_id, terminal_id, container, cols, rows, use_sudo).await
 }
