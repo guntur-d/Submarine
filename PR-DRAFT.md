@@ -201,7 +201,21 @@ diagnosis.
 **Verified:** `npm run build` ✅. Needs the live TUI to confirm end to
 end: copy in opencode → "Copied" toast → paste works outside.
 
-## Item 10 (staging — add while testing)
+## Item 10 (done, verified) — gateway process lifecycle docs
+
+**Problem:** starting `serve` was documented, but listing running
+instances and stopping them wasn't anywhere.
+
+**Change (`FORK.md` only):** "Managing the gateway process" section —
+one-instance-per-port, check commands (Windows/Linux/macOS), graceful
+Ctrl+C vs `taskkill`/`pkill` (verified the vault write path is atomic:
+tmp → fsync → rename in `save_vault_blocking`, so a force-kill loses at
+most the unflushed in-memory tail), background-run pointers, stable-token
+advice, and why there is deliberately no remote `stop` endpoint.
+
+**Verified:** docs-only; save path confirmed in code, no build needed.
+
+## Item 11 (staging — add while testing)
 
 <!-- Append each finding as its own item: problem / change / verification. -->
 

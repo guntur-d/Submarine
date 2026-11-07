@@ -121,6 +121,30 @@ HTTP + a WebSocket `invoke` bridge, so any browser becomes a client
 - Debug: `localStorage.setItem('submarine-term-debug','1')` in the browser
   console + reload → `[term …]` logs for copy/OSC 52 diagnosis.
 
+### Managing the gateway process
+
+`serve` is a plain foreground process — no service wrapper, no pidfile.
+One instance per port; a second one on the same port exits with
+`AddrInUse`.
+
+- **Start** (foreground, Ctrl+C stops cleanly — see above for the command
+  and flags).
+- **Check what's running** — Windows: `tasklist | findstr submarine`;
+  Linux/macOS: `ps aux | grep '[s]ubmarine serve'`. The live token is on
+  the process command line only at launch; the console output
+  (`submarine serve on …?token=…`) is the place to copy it from.
+- **Stop**: Ctrl+C in its console (graceful: drops the listener, keeps
+  the vault file consistent). No console access? Windows:
+  `taskkill /F /IM submarine.exe`; Linux/macOS: `pkill -f 'submarine serve'`
+  (SIGTERM first, `-9` only if stuck). Force-killing loses at most the
+  in-memory tail (recent command history not yet flushed) — the vault
+  itself is only ever rewritten whole by `save_vault`.
+- **Background**: Windows `Start-Process` / Task Scheduler, Linux
+  `nohup … &` / a systemd unit, macOS `launchd`. Pass a stable token via
+  `--token` or `SUBMARINE_SERVE_TOKEN` so reboots don't invalidate every
+  client's saved session. There is deliberately no remote `stop` endpoint
+  (it would be a shutdown button for anyone holding a leaked token).
+
 ## Code map for the gateway
 
 - `src-tauri/src/serve.rs` — HTTP static + token gate, WS protocol
