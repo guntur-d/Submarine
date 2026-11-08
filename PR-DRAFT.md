@@ -201,7 +201,34 @@ diagnosis.
 **Verified:** `npm run build` ✅. Needs the live TUI to confirm end to
 end: copy in opencode → "Copied" toast → paste works outside.
 
-## Item 10 (done, verified) — gateway process lifecycle docs
+## Item 11 (done, verified) — upstream-feedback hardening batch
+
+**Problem:** maintainer review on #270 (no PR for the epic, keep fork-side)
+listed four real holes: cross-origin `?gateway=` phishing, idle lock
+defeated by auto-sync polling, mirrors readable/writable with the vault
+locked, no origin/host check, 2 MiB upload cap.
+
+**Change (backend `src-tauri/src/serve.rs`):** `BACKGROUND_COMMANDS`
+denylist (`sync_now` no longer bumps the idle clock); `require_unlocked`
+gate (master-key presence) on all mirror arms + `parse_ssh_config`;
+`origin_allowed` same-origin enforcement on the auth middleware (covers WS
+upgrade too) with `--allow-remote` bypass + 403 + startup log line;
+2 GiB per-file upload cap with temp cleanup (`MAX_UPLOAD_BYTES`).
+
+**Change (frontend `src/`):** cross-origin `?gateway=` triggers an
+explicit `window.confirm` (same-origin flow untouched);
+`gatewayDisplayHost()` + title-bar chip always showing the backend host.
+
+**Docs:** `FORK.md` security posture section (fork cut, missing upstream
+fixes, loopback-first guidance). Smoke extended: cross-origin 403,
+no-Origin pass, `VAULT_LOCKED` mirrors, all in `scripts/serve-smoke.py`
+(moved in-repo from throwaway TEMP so it survives cleanup).
+
+**Verified:** `cargo check`/`build` clean (only pre-existing warnings),
+`npm run typecheck` ✅, `vite build` ✅, desktop `tauri dev` boots ✅,
+full WS smoke incl. new assertions ✅.
+
+## Item 12 (staging — add while testing)
 
 **Problem:** starting `serve` was documented, but listing running
 instances and stopping them wasn't anywhere.

@@ -81,6 +81,32 @@ function sameOriginWsUrl(): string {
   return `${wsProto}://${window.location.host}/api/ws`;
 }
 
+function isCrossOriginWs(url: string): boolean {
+  try {
+    return new URL(url, window.location.href).origin !== window.location.origin;
+  } catch {
+    // Unparseable URL — treat as hostile, caller refuses it.
+    return true;
+  }
+}
+
+// Host of the connected gateway for the title-bar chip, or null. The WS
+// URL host IS the backend — worth showing because a malicious link could
+// otherwise point a trusted-looking page at someone else's server.
+export function gatewayDisplayHost(): string | null {
+  const gw = getGateway();
+  if (!gw) return null;
+  return gatewayDisplayHostFor(gw.url);
+}
+
+function gatewayDisplayHostFor(url: string): string {
+  try {
+    return new URL(url, window.location.href).host;
+  } catch {
+    return url;
+  }
+}
+
 function readGatewayFromLocation(): GatewayConfig | null {
   try {
     const q = new URLSearchParams(window.location.search);
@@ -88,6 +114,18 @@ function readGatewayFromLocation(): GatewayConfig | null {
     if (!token) return null;
     // Explicit `?gateway=` wins (remote gateway, reverse proxy, custom port).
     const url = q.get("gateway") ?? sameOriginWsUrl();
+    // A link can point this page at ANY server, and everything typed here
+    // (including the master password) goes to that server. Cross-origin
+    // targets therefore need an explicit user decision — never silent.
+    // (The server additionally enforces same-origin unless --allow-remote.)
+    if (isCrossOriginWs(url)) {
+      const host = gatewayDisplayHostFor(url);
+      const ok = window.confirm(
+        `This page will connect to a different server:\n\n${host}\n\n` +
+          `Only continue if you trust it — passwords you type go to that server.`
+      );
+      if (!ok) return null;
+    }
     try {
       sessionStorage.setItem(GATEWAY_URL_KEY, url);
       sessionStorage.setItem(GATEWAY_TOKEN_KEY, token);

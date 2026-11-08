@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { invoke, isGateway, listen } from "./ipc";
+import { gatewayDisplayHost, invoke, isGateway, listen } from "./ipc";
 import { LogicalSize } from "@tauri-apps/api/window";
 import { getAppWindow } from "./gatewayWindow";
 import {
@@ -924,6 +924,18 @@ function DesktopApp() {
       <div className="hidden sm:flex items-center gap-2 pr-4 pl-[75px] md:pl-2" data-tauri-drag-region>
         <img src={logoUrl} alt="" draggable={false} className="h-6 w-auto max-w-[24px] object-contain select-none" />
         <span className="text-[12px] font-bold text-white tracking-tight">Submarine</span>
+        {/* Gateway backend indicator. In Tauri the backend is always local
+            by construction, so nothing to show; in gateway mode the WS host
+            IS where passwords and vault data go — always visible so a
+            malicious ?gateway= link can't hide behind trusted-looking UI. */}
+        {isGateway() && gatewayDisplayHost() && (
+          <span
+            className="text-[10px] font-mono text-emerald-300/80 bg-emerald-500/10 border border-emerald-500/20 rounded-full px-2 py-0.5 truncate max-w-[220px]"
+            title={`Backend server this UI is connected to: ${gatewayDisplayHost()}`}
+          >
+            {gatewayDisplayHost()}
+          </span>
+        )}
       </div>
 
       {/* Mobile session picker — replaces the horizontal tab strip on

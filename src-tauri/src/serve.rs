@@ -224,15 +224,74 @@ struct ServeState {
     ctx: Arc<ServeCtx>,
     token: String,
     bus: EventBus,
-    /// Last authenticated activity (any WS message or HTTP request). The
-    /// idle-lock timer reads it; every authed entry point bumps it.
+    /// Last authenticated activity (explicit user commands). The idle-lock
+    /// timer reads it; entry points bump it unless the command is on the
+    /// `BACKGROUND_COMMANDS` denylist below.
     /// `std` mutex: never held across `.await`.
     activity: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// `--allow-remote` bypasses the same-origin gate. Non-loopback binds
+    /// already require the flag, so a remote operator isn't asked twice;
+    /// loopback stays strict by default.
+    allow_remote: bool,
 }
 
 fn touch_activity(state: &ServeState) {
     if let Ok(mut t) = state.activity.lock() {
         *t = std::time::Instant::now();
+    }
+}
+
+/// Background/polling commands that must NOT count as user activity for the
+/// idle lock. The frontend's auto-sync fires `sync_now` every few minutes;
+/// counting it kept resetting the lock clock, so an abandoned tab could
+/// never lock. Everything else (keystrokes, clicks-as-invokes, uploads)
+/// bumps the clock. Keep this list to polling only — a missed entry merely
+/// delays locking, but a wrong entry locks out active users.
+const BACKGROUND_COMMANDS: &[&str] = &["sync_now"];
+
+/// Same-origin enforcement for browser clients (DNS-rebinding + malicious
+/// `?gateway=` link defense — a link can otherwise point a trusted-looking
+/// page at an attacker server and harvest the typed master password).
+/// Browsers always send `Origin` on WS upgrades and fetch POSTs;
+/// non-browser clients (curl, scripts) send none and pass through — the
+/// token still gates them. Compares the Origin authority against the request
+/// Host: same host+port passes, anything else needs `--allow-remote`.
+fn origin_allowed(headers: &header::HeaderMap, allow_remote: bool) -> bool {
+    if allow_remote {
+        return true;
+    }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let Some(origin) = origin else { return true };
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let Some(host) = host else { return true };
+    let origin_host = origin
+        .split("://")
+        .nth(1)
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("");
+    origin_host.eq_ignore_ascii_case(host)
+}
+
+/// Vault-open gate for commands that touch the server's filesystem without
+/// going through an SSH session. Desktop guarantees this implicitly (unlock
+/// precedes everything); the gateway enforces it explicitly. Without it a
+/// token could drive host-local file access via quick-connect sessions
+/// (which need no vault) without ever unlocking. `master_key` — not
+/// `active_profile` — is the signal: selecting a profile sets the latter
+/// without decrypting anything.
+fn require_unlocked(ctx: &ServeCtx) -> Result<(), String> {
+    let open = ctx
+        .db
+        .master_key
+        .lock()
+        .map(|g| g.is_some())
+        .map_err(|_| "[STATE] LOCK_FAILED")?;
+    if open {
+        Ok(())
+    } else {
+        Err("[STATE] VAULT_LOCKED: unlock a profile first".to_string())
     }
 }
 
@@ -723,12 +782,15 @@ async fn dispatch(ctx: &ServeCtx, bus: &EventBus, cmd: &str, args: &Value) -> Re
                 .map(|_| Value::Null)
         }
         "parse_ssh_config" => {
+            // Reads an arbitrary server-side path — vault-gated like mirrors.
+            require_unlocked(&ctx)?;
             parse_ssh_config_inner(req_opt_str(args, "path")).map(|v| json!(v))
         }
         "parse_client_import" => {
             parse_client_import_inner(req_str(args, "text")?).map(|v| json!(v))
         }
         "mirror_dry_run" => {
+            require_unlocked(&ctx)?;
             let spec: crate::mirror::MirrorSpec = match args.get("spec") {
                 Some(v) => serde_json::from_value(v.clone())
                     .map_err(|e| format!("[SERVE] BAD_ARG spec: {}", e))?,
@@ -739,6 +801,7 @@ async fn dispatch(ctx: &ServeCtx, bus: &EventBus, cmd: &str, args: &Value) -> Re
                 .map(|v| json!(v))
         }
         "start_mirror" => {
+            require_unlocked(&ctx)?;
             let spec: crate::mirror::MirrorSpec = match args.get("spec") {
                 Some(v) => serde_json::from_value(v.clone())
                     .map_err(|e| format!("[SERVE] BAD_ARG spec: {}", e))?,
@@ -749,11 +812,13 @@ async fn dispatch(ctx: &ServeCtx, bus: &EventBus, cmd: &str, args: &Value) -> Re
                 .map(|v| json!(v))
         }
         "stop_mirror" => {
+            require_unlocked(&ctx)?;
             stop_mirror_inner(&ctx.mirrors, req_str(args, "mirror_id")?)
                 .await
                 .map(|_| Value::Null)
         }
         "list_mirrors" => {
+            require_unlocked(&ctx)?;
             list_mirrors_inner(&ctx.mirrors, req_opt_str(args, "session_id"))
                 .await
                 .map(|v| json!(v))
@@ -1033,6 +1098,16 @@ fn request_token<B>(req: &Request<B>) -> Option<String> {
 }
 
 async fn require_token(State(state): State<Arc<ServeState>>, req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    // Origin first: a cross-origin caller must not even get to oracle
+    // whether a token is valid. Covers the WS upgrade too — it passes
+    // through this middleware before `ws_handler` runs.
+    if !origin_allowed(req.headers(), state.allow_remote) {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin gateway use requires --allow-remote",
+        )
+            .into_response();
+    }
     match request_token(&req) {
         Some(t) if token_eq(&t, &state.token) => {
             touch_activity(&state);
@@ -1089,12 +1164,6 @@ async fn ws_loop(
         tokio::select! {
             msg = socket.recv() => {
                 let Some(msg) = msg else { break };
-                // Any client frame counts as activity — keeps an idle-but-
-                // connected UI (subscribed, no clicks) from being locked out
-                // from under itself while events still flow to it.
-                if let Ok(mut t) = activity.lock() {
-                    *t = std::time::Instant::now();
-                }
                 let text = match msg {
                     Ok(Message::Text(text)) => text,
                     Ok(Message::Close(_)) | Err(_) => break,
@@ -1102,6 +1171,15 @@ async fn ws_loop(
                 };
                 match parse_incoming(&text) {
                     Ok(Incoming::Req(req)) => {
+                        // Only explicit user commands bump the idle clock.
+                        // Background polls (see BACKGROUND_COMMANDS) must not
+                        // — otherwise an abandoned tab keeps itself unlocked
+                        // forever just by auto-syncing.
+                        if !BACKGROUND_COMMANDS.contains(&req.cmd.as_str()) {
+                            if let Ok(mut t) = activity.lock() {
+                                *t = std::time::Instant::now();
+                            }
+                        }
                         let args = normalize_args(&req.args);
                         let resp = match dispatch(&ctx, &bus, &req.cmd, &args).await {
                             Ok(result) => WsResp { id: req.id, ok: true, result: Some(result), error: None },
@@ -1160,6 +1238,12 @@ async fn ws_loop(
 // HTTP file bridge
 // ---------------------------------------------------------------------------
 
+/// Hard cap per HTTP upload. Memory stays bounded regardless (chunks stream
+/// straight to a temp file, never buffered whole) — this caps disk use, not
+/// RAM. 2 GiB covers ISOs and backups; raise deliberately (don't silently
+/// fail) if a workflow needs more.
+const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Staging path for one upload/download. Random hex name (no client input in
 /// the path), cleaned up by the caller on every exit path.
 fn temp_stage_path(prefix: &str) -> PathBuf {
@@ -1212,9 +1296,18 @@ async fn files_upload(
                     Err(e) => return fail(format!("[SERVE] TEMP_CREATE: {}", e)),
                 };
                 let mut ok = true;
+                let mut total: u64 = 0;
                 loop {
                     match field.chunk().await {
                         Ok(Some(chunk)) => {
+                            total += chunk.len() as u64;
+                            if total > MAX_UPLOAD_BYTES {
+                                let _ = tokio::fs::remove_file(&path).await;
+                                return fail(format!(
+                                    "[SERVE] TOO_LARGE: capped at {} bytes",
+                                    MAX_UPLOAD_BYTES
+                                ));
+                            }
                             if let Err(e) = f.write_all(&chunk).await {
                                 let _ = tokio::fs::remove_file(&path).await;
                                 return fail(format!("[SERVE] TEMP_WRITE: {}", e));
@@ -1508,7 +1601,13 @@ pub fn run_serve(raw_args: Vec<String>) {
         )),
         docker_streams: std::sync::Arc::new(docker::DockerStreams::new()),
     });
-    let state = Arc::new(ServeState { ctx, token: token.clone(), bus, activity });
+    let state = Arc::new(ServeState {
+        ctx,
+        token: token.clone(),
+        bus,
+        activity,
+        allow_remote,
+    });
 
     // Idle auto-lock: same teardown as a manual lock, on a timer. Fires at
     // most once per idle window (the clock resets after locking, so an
@@ -1556,6 +1655,14 @@ pub fn run_serve(raw_args: Vec<String>) {
     } else {
         println!("idle auto-lock: off");
     }
+    println!(
+        "origin policy: {}",
+        if allow_remote {
+            "cross-origin allowed (--allow-remote)"
+        } else {
+            "same-origin only"
+        }
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -130,9 +130,16 @@ One instance per port; a second one on the same port exits with
 - **Start** (foreground, Ctrl+C stops cleanly — see above for the command
   and flags).
 - **Check what's running** — Windows: `tasklist | findstr submarine`;
-  Linux/macOS: `ps aux | grep '[s]ubmarine serve'`. The live token is on
-  the process command line only at launch; the console output
-  (`submarine serve on …?token=…`) is the place to copy it from.
+  Linux/macOS: `ps aux | grep '[s]ubmarine serve'`.
+- **Recovering the token** — depends on how the server was started:
+  - Fixed token (`--token …` or `SUBMARINE_SERVE_TOKEN=…`): you already
+    know it. (Note: a `--token` value is visible in the process list to
+    anyone on the machine; prefer the env var on shared hosts.)
+  - Random token (default): it exists only in the server's startup
+    console output (`submarine serve on …?token=…`) — or wherever that
+    output was redirected. If that output is gone, there is no recovery
+    by design (no endpoint will hand it out); restart the server for a
+    fresh token, or switch to a fixed token so this stops happening.
 - **Stop**: Ctrl+C in its console (graceful: drops the listener, keeps
   the vault file consistent). No console access? Windows:
   `taskkill /F /IM submarine.exe`; Linux/macOS: `pkill -f 'submarine serve'`
@@ -144,6 +151,23 @@ One instance per port; a second one on the same port exits with
   `--token` or `SUBMARINE_SERVE_TOKEN` so reboots don't invalidate every
   client's saved session. There is deliberately no remote `stop` endpoint
   (it would be a shutdown button for anyone holding a leaked token).
+
+### Security posture (read this before exposing the gateway)
+
+- This fork is cut at upstream v0.3.8 plus fork-only work. It **misses
+  upstream security fixes since August 2026** (per the maintainer on
+  #270). Treat the gateway as experimental: loopback-only unless you
+  have a reason, TLS or reverse proxy on any network bind, fixed token
+  via env, idle lock left on.
+- Same-origin enforcement: browsers talking to a gateway on another
+  origin are rejected with 403 unless `--allow-remote` is set. A
+  `?gateway=` link pointing at a foreign server triggers an explicit
+  browser confirm first — everything typed goes to that server, so the
+  connected host is also pinned as a chip in the title bar.
+- Background polling (`sync_now`) does not reset the idle lock; only
+  explicit user commands do. Mirror/file-import commands require an
+  unlocked vault. HTTP uploads are capped at 2 GiB per file (streamed,
+  never buffered whole).
 
 ## Code map for the gateway
 
