@@ -649,26 +649,15 @@ const TerminalView = ({
     // selection) still can't clobber it. The selection end is set by the last
     // mousemove, so it's final by the time we read it on mouseup.
     let selectionArmed = false;
-    // Snapshot of the local selection when the drag started. Mouse-tracking
-    // TUIs (opencode, zellij, …) consume the drag themselves and show their
-    // own "Copied" UI — xterm then creates no local selection, so copying at
-    // release would just re-copy STALE text with a lying toast. If the text
-    // is unchanged since mousedown, this drag produced nothing: skip.
-    let selectionAtDown: string | null = null;
     const onMouseDown = (ev: MouseEvent) => {
       // Assign (not just set-true) so a non-left mousedown re-disarms a flag
       // that got stuck from an earlier drag whose mouseup we never saw.
       selectionArmed = ev.button === 0;
-      selectionAtDown = selectionArmed ? buildSelectedText() : null;
-      termDbg(`mousedown button=${ev.button} armed=${selectionArmed} snapshotLen=${selectionAtDown?.length ?? -1} buf=${term.buffer.active.type}`);
+      termDbg(`mousedown button=${ev.button} armed=${selectionArmed} buf=${term.buffer.active.type}`);
     };
     const onDocMouseUp = (ev: MouseEvent) => {
       if (ev.button !== 0 || !selectionArmed) return;
       selectionArmed = false;
-      const snapshot = selectionAtDown;
-      selectionAtDown = null;
-      const now = buildSelectedText();
-      if (now === snapshot) { termDbg(`mouseup skip: unchanged (len=${now.length} buf=${term.buffer.active.type})`); return; }
       void copySelectionIfAny('mouseup');
     };
     // If the window loses focus mid-drag (Alt-Tab, a focus-stealing dialog),
@@ -677,7 +666,7 @@ const TerminalView = ({
     // unrelated left-click would then copy this terminal's stale selection and
     // clobber the clipboard. Disarm on blur so only a release we actually see
     // can copy.
-    const onWindowBlur = () => { selectionArmed = false; selectionAtDown = null; };
+    const onWindowBlur = () => { selectionArmed = false; };
     // Right-click → paste clipboard into the PTY. preventDefault swallows the
     // platform context menu so the user gets the terminal-style behavior they
     // asked for. Disabled sessions silently drop the paste (matches onData).

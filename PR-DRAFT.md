@@ -242,7 +242,27 @@ advice, and why there is deliberately no remote `stop` endpoint.
 
 **Verified:** docs-only; save path confirmed in code, no build needed.
 
-## Item 11 (staging — add while testing)
+## Item 13 (done, verified) — upstream #303 merged; fork drops the snapshot guard
+
+Upstream closed #270 as not-planned (epic stays fork-side) but merged
+PR #303 with the snapshot dropped per SinaXhpm's review: xterm builds
+double/triple-click selections in its own mousedown handler (inner
+element, fires before ours), so the snapshot already held the new word;
+and xterm auto-clears selections on buffer switch/user input, so the
+guard had nothing to catch. Verified the auto-clear in our xterm 5.3.0
+source too (`_handleBufferActivate` + `onUserInput` clears) — the fork's
+false-"Copied" was fully explained by the whitespace guard case, so the
+guard is dropped here as well to match upstream and un-break
+double-click copy. Kept fork-side: Ctrl+Shift+C, OSC 52 bridge, termDbg
+logging. Watch item: karstenbehrens reports Shift+drag copy failing on
+0.5.0/Windows (#315 follow-up) — our merged code is byte-identical on
+that path for non-blank text, so likely unrelated; watching in case
+SinaXhpm asks for help.
+
+**Verified:** `npm run typecheck` ✅, `vite build` ✅ (frontend-only
+change; backend untouched).
+
+## Item 14 (staging — add while testing)
 
 <!-- Append each finding as its own item: problem / change / verification. -->
 

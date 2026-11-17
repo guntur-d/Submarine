@@ -50,10 +50,15 @@ typecheck ✅, vite build ✅, `tauri dev` boots ✅, WS smoke green ✅):
 - **Stale-token UX** (`src/App.tsx` mount probe + "token rejected" card
   with paste-a-token form; `src/ipc.ts` `forgetGateway`/`checkGateway`).
 - **Terminal copy hardening** (`src/components/TerminalView.tsx`):
-  `Ctrl+Shift+C` copies; select-to-copy skips unchanged (mouse-tracking
-  TUIs) and whitespace-only selections instead of lying; `OSC 52`
-  clipboard bridge so TUI-internal copies reach the OS clipboard; debug
-  logging behind `localStorage submarine-term-debug=1`.
+  `Ctrl+Shift+C` copies; select-to-copy skips whitespace-only selections
+  instead of lying; `OSC 52` clipboard bridge so TUI-internal copies reach
+  the OS clipboard; debug logging behind `localStorage
+  submarine-term-debug=1`. (A mousedown-snapshot guard for app-consumed
+  drags was tried and dropped: xterm makes double/triple-click selections
+  in its own mousedown handler first, so the snapshot already held the new
+  text — and xterm auto-clears selections on buffer switch/user input, so
+  the guard had nothing to catch. Upstream #303 merged the whitespace-only
+  half on the same reasoning.)
 
 ## Features (all in `src/`, upstream-eligible)
 
