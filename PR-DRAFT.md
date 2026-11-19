@@ -262,11 +262,15 @@ SinaXhpm asks for help.
 **Verified:** `npm run typecheck` ✅, `vite build` ✅ (frontend-only
 change; backend untouched).
 
-## Item 14 (staging — add while testing)
+## Item 14 (standing by — waiting on upstream, no active work)
 
-<!-- Append each finding as its own item: problem / change / verification. -->
-
-- [ ] _pending — fill in while testing the app_
+Upstream closed #270 as not-planned (2026-11-13) and merged #303
+(whitespace-only half; snapshot guard dropped per review). Nothing is
+owed to anyone: the fork is self-contained and documented, the gateway
+epic lives here permanently unless upstream invites another small PR.
+Open threads to watch (no action unless asked): #315 follow-up
+(karstenbehrens' Windows Shift+drag report), any further review comments
+on #303.
 
 ## Parked epics (NOT in this batch — separate upstream issue/PR each)
 
